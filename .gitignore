@@ -1,0 +1,16 @@
+.DS_Store
+
+# Local tooling
+.claude/
+.pytest_cache/
+.venv*/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Experiment outputs and checkpoints
+runs/
