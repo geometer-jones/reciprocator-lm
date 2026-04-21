@@ -26,6 +26,16 @@ def test_add_device_argument_defaults_to_cpu() -> None:
     assert args.device == "cpu"
 
 
+def test_add_device_argument_help_uses_configured_default() -> None:
+    runtime = _load_runtime_module()
+    parser = argparse.ArgumentParser()
+    runtime.add_device_argument(parser, default="auto")
+
+    help_text = parser.format_help()
+
+    assert "Defaults to auto" in help_text
+
+
 def test_resolve_torch_device_auto_prefers_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _load_runtime_module()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

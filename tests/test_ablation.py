@@ -81,19 +81,45 @@ def test_train_reciprocator_only_resolves_asymmetric_growth_recipe() -> None:
     assert max_mode_sizes == (1, 4, 16)
 
 
-def test_train_reciprocator_only_defaults_to_per_mode_normalization() -> None:
+def test_train_reciprocator_only_pads_rank8_max_mode_size_shorthand() -> None:
+    train_script = _load_script_module("train_reciprocator_only.py")
+
+    init_mode_sizes, max_mode_sizes = train_script._resolve_mode_sizes(
+        state_rank=4,
+        max_state_rank=8,
+        init_mode_sizes=(4, 4, 2, 2),
+        max_mode_sizes=(8, 8, 4, 4),
+        init_state_capacity=None,
+        state_capacity=None,
+    )
+
+    assert init_mode_sizes == (4, 4, 2, 2, 1, 1, 1, 1)
+    assert max_mode_sizes == (8, 8, 4, 4, 2, 2, 2, 2)
+
+
+def test_train_reciprocator_only_defaults_to_frobenius_normalization() -> None:
     train_script = _load_script_module("train_reciprocator_only.py")
 
     args = train_script._build_arg_parser().parse_args([])
 
     assert args.dynamic_rank is True
-    assert args.normalization == "per_mode"
+    assert args.normalization == "frobenius"
     assert args.learned_per_mode_scaling is True
     assert args.learnable_prediction_eta is True
     assert args.learnable_coupling_temperature is True
     assert args.learned_normalization_blend is True
+    assert args.device == "auto"
     assert args.steps == 5000
-    assert args.batch_size == 8
+    assert args.batch_size == 2
+    assert args.seq_len == 256
+    assert args.dim == 256
+    assert args.layers == 4
+    assert args.heads == 8
+    assert args.state_rank == 4
+    assert args.max_state_rank == 8
+    assert args.init_mode_sizes == (4, 4, 2, 2)
+    assert args.max_mode_sizes == (8, 8, 4, 4)
+    assert args.dropout == pytest.approx(0.05)
     assert args.log_every == 100
     assert args.save_every == 100
     assert args.eval_every == 100
@@ -110,11 +136,22 @@ def test_train_reciprocator_only_fresh_run_defaults_to_streaming_runtime_mode() 
 
     training_mode = args.training_mode or None or train_script.DEFAULT_FRESH_TRAINING_MODE
     stream_reset_policy = args.stream_reset_policy or None or train_script.DEFAULT_FRESH_STREAM_RESET_POLICY
+    lr_schedule = args.lr_schedule or None or train_script.DEFAULT_FRESH_LR_SCHEDULE
+    warmup_fraction = (
+        train_script.DEFAULT_FRESH_WARMUP_FRACTION if args.warmup_fraction is None else args.warmup_fraction
+    )
+    min_lr_ratio = train_script.DEFAULT_FRESH_MIN_LR_RATIO if args.min_lr_ratio is None else args.min_lr_ratio
 
     assert args.training_mode is None
     assert args.stream_reset_policy is None
+    assert args.lr_schedule is None
+    assert args.warmup_fraction is None
+    assert args.min_lr_ratio is None
     assert training_mode == "streaming"
     assert stream_reset_policy == "wrap"
+    assert lr_schedule == "cosine"
+    assert warmup_fraction == pytest.approx(0.02)
+    assert min_lr_ratio == pytest.approx(0.1)
 
 
 def test_train_reciprocator_only_can_opt_back_into_online_demo() -> None:

@@ -39,6 +39,11 @@ def make_model() -> ModifiedTransformerLM:
     return ModifiedTransformerLM(config)
 
 
+def _assert_prediction_projector_has_grad(projector: torch.nn.Module) -> None:
+    assert any(weight.grad is not None for weight in projector.weight_real)
+    assert any(weight.grad is not None for weight in projector.weight_imag)
+
+
 def test_config_derives_rank3_state_shape() -> None:
     config = ModelConfig(
         vocab_size=32,
@@ -51,7 +56,7 @@ def test_config_derives_rank3_state_shape() -> None:
     assert config.state_dim == 27
     assert config.state_mode_sizes == (3, 3, 3)
     assert config.num_cube_engines == 4
-    assert config.normalization == "per_mode"
+    assert config.normalization == "frobenius"
     assert config.learned_per_mode_scaling is False
     assert config.prediction_eta == pytest.approx(0.1)
     assert config.learnable_prediction_eta is False
@@ -60,6 +65,14 @@ def test_config_derives_rank3_state_shape() -> None:
     assert config.selective_gains is False
     assert config.learnable_coupling_temperature is False
     assert config.learned_normalization_blend is False
+    assert config.use_spectral_reciprocation is True
+    assert config.learnable_spectral_reciprocation is True
+    assert config.spectral_mode == "wavelet_packet_max_ultimate"
+    assert config.joint_spectral_mode is True
+    assert config.wavelet_name == "haar"
+    assert config.wavelet_levels == 3
+    assert config.wavelet_packet_best_basis is True
+    assert config.wavelet_packet_stationary is True
     assert config.adaptive_growth_controls is False
 
 
@@ -109,6 +122,22 @@ def test_config_pads_init_mode_sizes_for_dynamic_rank_growth() -> None:
     assert config.state_dim == 24
 
 
+def test_config_pads_rank8_max_mode_sizes_from_initial_rank_shorthand() -> None:
+    config = ModelConfig(
+        vocab_size=32,
+        state_rank=4,
+        max_state_rank=8,
+        dynamic_rank=True,
+        init_mode_sizes=(4, 4, 2, 2),
+        max_mode_sizes=(8, 8, 4, 4),
+    )
+
+    assert config.init_mode_sizes == (4, 4, 2, 2, 1, 1, 1, 1)
+    assert config.max_mode_sizes == (8, 8, 4, 4, 2, 2, 2, 2)
+    assert config.state_mode_sizes == (8, 8, 4, 4, 2, 2, 2, 2)
+    assert config.state_dim == 16384
+
+
 def test_config_rejects_dynamic_rank_growth_into_singleton_future_mode() -> None:
     with pytest.raises(ValueError, match="at least 2 slots"):
         ModelConfig(
@@ -144,6 +173,17 @@ def test_config_allows_learned_per_mode_scaling_when_normalization_family_is_lea
     assert config.normalization == "frobenius"
     assert config.learned_per_mode_scaling is True
     assert config.learned_normalization_blend is True
+
+
+def test_config_rejects_learnable_spectral_reciprocation_without_spectral_block() -> None:
+    with pytest.raises(ValueError, match="learnable_spectral_reciprocation requires use_spectral_reciprocation=True"):
+        ModelConfig(
+            vocab_size=32,
+            state_rank=3,
+            state_mode_sizes=(3, 3, 3),
+            use_spectral_reciprocation=False,
+            learnable_spectral_reciprocation=True,
+        )
 
 
 def test_model_config_defaults_ffn_on_difference_when_loading_legacy_payload() -> None:
@@ -263,8 +303,7 @@ def test_backward_pass_produces_gradients() -> None:
     assert len(model.blocks[0].mixer.cube_engines) == 3
     for engine in model.blocks[0].mixer.cube_engines:
         assert engine.input_gain.grad is not None
-        assert engine.prediction_proj.weight_real.grad is not None
-        assert engine.prediction_proj.weight_imag.grad is not None
+        _assert_prediction_projector_has_grad(engine.prediction_proj)
 
 
 def test_model_is_causal() -> None:
@@ -603,8 +642,7 @@ def test_reciprocator_only_backward_pass() -> None:
     assert model.blocks[0].mixer.signal_proj.weight_real.grad is not None
     for engine in model.blocks[0].mixer.cube_engines:
         assert engine.input_gain.grad is not None
-        assert engine.prediction_proj.weight_real.grad is not None
-        assert engine.prediction_proj.weight_imag.grad is not None
+        _assert_prediction_projector_has_grad(engine.prediction_proj)
 
 
 def test_apply_complex_rope_matches_expected_complex_rotation() -> None:
@@ -651,8 +689,7 @@ def test_reciprocator_only_parallel_selection_backward_pass() -> None:
     assert model.blocks[0].mixer.gain_proj.weight.grad is not None
     assert model.blocks[0].mixer.gain_predictor.signal_out.weight.grad is not None
     for engine in model.blocks[0].mixer.cube_engines:
-        assert engine.prediction_proj.weight_real.grad is not None
-        assert engine.prediction_proj.weight_imag.grad is not None
+        _assert_prediction_projector_has_grad(engine.prediction_proj)
 
 
 def test_reciprocator_only_serial_relational_selection_backward_pass() -> None:
@@ -1252,8 +1289,7 @@ def test_cube_engine_prediction_error_term_updates_state() -> None:
         cell.recurrent_gain.zero_()
         cell.carry_gain.zero_()
         cell.decay.fill_(-30.0)
-        cell.prediction_proj.weight_real.copy_(torch.eye(2))
-        cell.prediction_proj.weight_imag.zero_()
+        cell.prediction_proj.set_identity_()
 
     signal_real = torch.tensor([[1.0, 0.0]])
     signal_imag = torch.zeros_like(signal_real)
@@ -1301,8 +1337,7 @@ def test_cube_engine_growth_uses_prediction_error_signal() -> None:
         cell.recurrent_gain.zero_()
         cell.carry_gain.zero_()
         cell.decay.fill_(-30.0)
-        cell.prediction_proj.weight_real.copy_(torch.eye(2))
-        cell.prediction_proj.weight_imag.zero_()
+        cell.prediction_proj.set_identity_()
 
     state_real = torch.tensor([[1.0, 0.0]])
     state_imag = torch.zeros_like(state_real)
@@ -1364,6 +1399,8 @@ def test_cube_engine_gradient_flows_through_active_region() -> None:
     signal_imag = torch.randn(1, 3, 3, 3)
     state_real = torch.randn(1, 3, 3, 3)
     state_imag = torch.randn(1, 3, 3, 3)
+    with torch.no_grad():
+        cell.prediction_state_mix.fill_(1.0)
 
     next_real, next_imag, _, _, _ = cell.step(
         signal_real=signal_real,
@@ -1386,26 +1423,24 @@ def test_cube_engine_gradient_flows_through_active_region() -> None:
     assert torch.count_nonzero(grad[~active_mask]) == 0
     coupling_real_grad = cell.cpl_proj_real[0].grad
     coupling_imag_grad = cell.cpl_proj_imag[0].grad
-    prediction_real_grad = cell.prediction_proj.weight_real.grad
-    prediction_imag_grad = cell.prediction_proj.weight_imag.grad
     assert coupling_real_grad is not None
     assert coupling_imag_grad is not None
-    assert prediction_real_grad is not None
-    assert prediction_imag_grad is not None
     active_mode = active_sizes[0]
     assert coupling_real_grad[:active_mode, :active_mode].abs().sum().item() > 0.0
     assert coupling_imag_grad[:active_mode, :active_mode].abs().sum().item() > 0.0
-    active_feature_mask = active_mask.reshape(-1)
-    assert prediction_real_grad[active_feature_mask][:, active_feature_mask].abs().sum().item() > 0.0
-    assert prediction_imag_grad[active_feature_mask][:, active_feature_mask].abs().sum().item() > 0.0
     assert torch.count_nonzero(coupling_real_grad[active_mode:, :]) == 0
     assert torch.count_nonzero(coupling_real_grad[:, active_mode:]) == 0
     assert torch.count_nonzero(coupling_imag_grad[active_mode:, :]) == 0
     assert torch.count_nonzero(coupling_imag_grad[:, active_mode:]) == 0
-    assert torch.count_nonzero(prediction_real_grad[~active_feature_mask, :]) == 0
-    assert torch.count_nonzero(prediction_real_grad[:, ~active_feature_mask]) == 0
-    assert torch.count_nonzero(prediction_imag_grad[~active_feature_mask, :]) == 0
-    assert torch.count_nonzero(prediction_imag_grad[:, ~active_feature_mask]) == 0
+    for mode_idx, active_mode in enumerate(active_sizes):
+        prediction_real_grad = cell.prediction_proj.weight_real[mode_idx].grad
+        prediction_imag_grad = cell.prediction_proj.weight_imag[mode_idx].grad
+        assert prediction_real_grad is not None
+        assert prediction_imag_grad is not None
+        assert torch.count_nonzero(prediction_real_grad[active_mode:, :]) == 0
+        assert torch.count_nonzero(prediction_real_grad[:, active_mode:]) == 0
+        assert torch.count_nonzero(prediction_imag_grad[active_mode:, :]) == 0
+        assert torch.count_nonzero(prediction_imag_grad[:, active_mode:]) == 0
 
 
 def test_cube_engine_phase_aware_couplings_change_with_phase() -> None:
@@ -1770,6 +1805,209 @@ def test_cube_engine_matches_legacy_update_when_accumulator_modulation_disabled(
         torch.testing.assert_close(actual_part, expected_part)
 
 
+def test_cube_engine_spectral_reciprocation_matches_manual_fft_filter() -> None:
+    torch.manual_seed(0)
+    active_sizes = (2, 2)
+    cell = _CubeEngineCell(
+        state_rank=2,
+        max_mode_sizes=active_sizes,
+        normalization="frobenius",
+        impression_rate=0.35,
+        growth_threshold=1.0,
+        growth_interval=1,
+        prune_floor=0.0,
+        prune_horizon=32,
+        prediction_eta=0.2,
+        accumulator_modulates_gains=False,
+        use_spectral_reciprocation=True,
+        spectral_mode="fft",
+        spectral_low_frequency_gain=0.4,
+        spectral_low_frequency_sigma=0.15,
+        spectral_high_frequency_gain=0.3,
+        spectral_high_frequency_cutoff=0.1,
+    )
+
+    signal_real = torch.randn(2, *active_sizes)
+    signal_imag = torch.randn(2, *active_sizes)
+    state_real = torch.randn(2, *active_sizes)
+    state_imag = torch.randn(2, *active_sizes)
+    magnitude_accumulator = torch.rand(2, *active_sizes)
+    carry_real = torch.randn(2, *active_sizes)
+    carry_imag = torch.randn(2, *active_sizes)
+
+    actual = cell.step(
+        signal_real=signal_real,
+        signal_imag=signal_imag,
+        state_real=state_real,
+        state_imag=state_imag,
+        magnitude_accumulator=magnitude_accumulator,
+        carry_real=carry_real,
+        carry_imag=carry_imag,
+        active_sizes=active_sizes,
+        step_index=1,
+        allow_growth=False,
+    )
+
+    signal_real = _mask_to_active(signal_real, active_sizes, cell.state_rank)
+    signal_imag = _mask_to_active(signal_imag, active_sizes, cell.state_rank)
+    state_real = _mask_to_active(state_real, active_sizes, cell.state_rank)
+    state_imag = _mask_to_active(state_imag, active_sizes, cell.state_rank)
+    magnitude_accumulator = _mask_to_active(magnitude_accumulator, active_sizes, cell.state_rank)
+    carry_real = _mask_to_active(carry_real, active_sizes, cell.state_rank)
+    carry_imag = _mask_to_active(carry_imag, active_sizes, cell.state_rank)
+
+    local_real, local_imag = _relational_product(
+        signal_real,
+        signal_imag,
+        state_real,
+        state_imag,
+        active_sizes,
+        cell.state_rank,
+    )
+    if cell.use_expressive_mode_couplings:
+        coupled_real, coupled_imag = cell._apply_expressive_mode_couplings(
+            local_real,
+            local_imag,
+            active_sizes,
+        )
+    else:
+        mode_couplings = cell._phase_aware_mode_couplings(local_real, local_imag, active_sizes)
+        coupled_real, coupled_imag = _apply_mode_couplings_pair(
+            local_real,
+            local_imag,
+            mode_couplings,
+            cell.state_rank,
+        )
+    predicted_signal_real, predicted_signal_imag = cell._predict_signal(
+        state_real,
+        state_imag,
+        magnitude_accumulator,
+        active_sizes,
+        cell.state_rank,
+    )
+    prediction_error_real = signal_real - predicted_signal_real
+    prediction_error_imag = signal_imag - predicted_signal_imag
+
+    proposal_real = (
+        torch.sigmoid(cell.decay).unsqueeze(0) * state_real
+        + torch.sigmoid(cell.input_gain).unsqueeze(0) * signal_real
+        + torch.tanh(cell.recurrent_gain).unsqueeze(0) * coupled_real
+        + torch.tanh(cell.carry_gain).unsqueeze(0) * carry_real
+        + cell.prediction_eta * prediction_error_real
+    )
+    proposal_imag = (
+        torch.sigmoid(cell.decay).unsqueeze(0) * state_imag
+        + torch.sigmoid(cell.input_gain).unsqueeze(0) * signal_imag
+        + torch.tanh(cell.recurrent_gain).unsqueeze(0) * coupled_imag
+        + torch.tanh(cell.carry_gain).unsqueeze(0) * carry_imag
+        + cell.prediction_eta * prediction_error_imag
+    )
+    proposal_real = _mask_to_active(proposal_real, active_sizes, cell.state_rank)
+    proposal_imag = _mask_to_active(proposal_imag, active_sizes, cell.state_rank)
+    proposal_magnitude = _mask_to_active(
+        torch.sqrt(proposal_real.square() + proposal_imag.square() + 1e-6),
+        active_sizes,
+        cell.state_rank,
+    )
+    expected_accumulator = _mask_to_active(
+        cell.magnitude_decay * magnitude_accumulator + (1.0 - cell.magnitude_decay) * proposal_magnitude,
+        active_sizes,
+        cell.state_rank,
+    )
+    expected_real, expected_imag = _normalize_complex_tensor(
+        proposal_real,
+        proposal_imag,
+        cell.normalization,
+        state_rank=cell.state_rank,
+    )
+    expected_state = torch.complex(expected_real, expected_imag)
+    freq = torch.fft.fftn(expected_state, dim=(1, 2))
+    freq_axes = [torch.fft.fftfreq(size).to(dtype=expected_real.dtype) for size in active_sizes]
+    radius_squared = torch.zeros(active_sizes, dtype=expected_real.dtype)
+    for axis in torch.meshgrid(*freq_axes, indexing="ij"):
+        radius_squared = radius_squared + axis.square()
+    spectral_filter = 1.0 + cell.spectral_low_frequency_gain * torch.exp(
+        -radius_squared / (cell.spectral_low_frequency_sigma**2)
+    )
+    radius = torch.sqrt(radius_squared + 1e-12)
+    smoothing_width = expected_real.new_tensor(cell.spectral_low_frequency_sigma).clamp_min(5e-2)
+    low_band_gate = torch.sigmoid((cell.spectral_high_frequency_cutoff - radius) / smoothing_width)
+    spectral_filter = spectral_filter * (
+        cell.spectral_high_frequency_gain + (1.0 - cell.spectral_high_frequency_gain) * low_band_gate
+    )
+    expected_state = torch.fft.ifftn(freq * spectral_filter.unsqueeze(0), dim=(1, 2))
+    expected_real, expected_imag = _normalize_complex_tensor(
+        expected_state.real,
+        expected_state.imag,
+        cell.normalization,
+        state_rank=cell.state_rank,
+    )
+    expected_real = _mask_to_active(expected_real, active_sizes, cell.state_rank)
+    expected_imag = _mask_to_active(expected_imag, active_sizes, cell.state_rank)
+
+    expected = (
+        expected_real,
+        expected_imag,
+        expected_accumulator,
+        expected_real,
+        expected_imag,
+    )
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(actual_part, expected_part)
+    frobenius_norm = torch.sqrt((actual[0].square() + actual[1].square()).sum(dim=(1, 2)))
+    torch.testing.assert_close(frobenius_norm, torch.ones_like(frobenius_norm))
+
+
+def test_cube_engine_learnable_spectral_params_receive_gradients() -> None:
+    torch.manual_seed(0)
+    active_sizes = (2, 2)
+    cell = _CubeEngineCell(
+        state_rank=2,
+        max_mode_sizes=active_sizes,
+        normalization="frobenius",
+        impression_rate=0.35,
+        growth_threshold=1.0,
+        growth_interval=1,
+        prune_floor=0.0,
+        prune_horizon=32,
+        use_spectral_reciprocation=True,
+        learnable_spectral_reciprocation=True,
+        spectral_mode="wavelet_packet_max_gauge",
+    )
+
+    signal_real = torch.randn(2, *active_sizes)
+    signal_imag = torch.randn(2, *active_sizes)
+    state_real = torch.randn(2, *active_sizes)
+    state_imag = torch.randn(2, *active_sizes)
+    magnitude_accumulator = torch.rand(2, *active_sizes)
+    carry_real = torch.randn(2, *active_sizes)
+    carry_imag = torch.randn(2, *active_sizes)
+
+    next_real, next_imag, _, _, _ = cell.step(
+        signal_real=signal_real,
+        signal_imag=signal_imag,
+        state_real=state_real,
+        state_imag=state_imag,
+        magnitude_accumulator=magnitude_accumulator,
+        carry_real=carry_real,
+        carry_imag=carry_imag,
+        active_sizes=active_sizes,
+        step_index=1,
+        allow_growth=False,
+    )
+    loss = next_real.square().mean() + next_imag.square().mean()
+    loss.backward()
+
+    assert cell.spectral_low_frequency_gain_raw is not None
+    assert cell.spectral_low_frequency_gain_raw.grad is not None
+    assert cell.spectral_low_frequency_sigma_raw is not None
+    assert cell.spectral_low_frequency_sigma_raw.grad is not None
+    assert cell.spectral_high_frequency_gain_raw is not None
+    assert cell.spectral_high_frequency_gain_raw.grad is not None
+    assert cell.spectral_high_frequency_cutoff_raw is not None
+    assert cell.spectral_high_frequency_cutoff_raw.grad is not None
+
+
 def test_cube_engine_relational_prediction_branch_uses_phase_aware_self_transport() -> None:
     cell = _CubeEngineCell(
         state_rank=2,
@@ -1787,8 +2025,7 @@ def test_cube_engine_relational_prediction_branch_uses_phase_aware_self_transpor
     magnitude_accumulator = torch.full_like(state_real, 0.25)
 
     with torch.no_grad():
-        cell.prediction_proj.weight_real.zero_()
-        cell.prediction_proj.weight_imag.zero_()
+        cell.prediction_proj.zero_()
         cell.prediction_state_mix.zero_()
         cell.prediction_coupling_mix.fill_(1.25)
 
@@ -1875,8 +2112,7 @@ def test_cube_engine_accumulator_strengthens_recurrent_update() -> None:
         cell.accumulator_carry_gain_scale.fill_(-20.0)
         cell.accumulator_recurrent_gain_scale.fill_(0.0)
         cell.accumulator_coupling_scale.fill_(0.0)
-        cell.prediction_proj.weight_real.zero_()
-        cell.prediction_proj.weight_imag.zero_()
+        cell.prediction_proj.zero_()
         cell.mode_couplings[0].zero_()
 
     base_kwargs = dict(
@@ -1954,8 +2190,7 @@ def test_parallel_mixer_accumulator_modulation_amplifies_late_steps() -> None:
             engine.accumulator_carry_gain_scale.fill_(-20.0)
             engine.accumulator_recurrent_gain_scale.fill_(0.0)
             engine.accumulator_coupling_scale.fill_(0.0)
-            engine.prediction_proj.weight_real.zero_()
-            engine.prediction_proj.weight_imag.zero_()
+            engine.prediction_proj.zero_()
             mixer.engine_state_to_hidden[0].weight_real.zero_()
             mixer.engine_state_to_hidden[0].weight_imag.zero_()
             mixer.engine_state_to_hidden[0].weight_real[0, 3] = 1.0
@@ -2005,9 +2240,8 @@ def test_mixer_preallocated_projections() -> None:
     assert signal_grad.shape[0] == 27
     assert signal_grad.abs().sum(dim=1)[active_mask].sum().item() > 0.0
     assert torch.count_nonzero(signal_grad.abs().sum(dim=1)[~active_mask]) == 0
-    feature_mask = active_mask.repeat(4)
-    assert hidden_grad.abs().sum(dim=0)[feature_mask].sum().item() > 0.0
-    assert torch.count_nonzero(hidden_grad.abs().sum(dim=0)[~feature_mask]) == 0
+    assert hidden_grad.shape[1] == mixer.engine_state_feature_dim
+    assert hidden_grad.abs().sum().item() > 0.0
 
 
 def test_online_mixer_preallocated_projections_respect_active_mask() -> None:
@@ -2600,8 +2834,7 @@ def test_reciprocator_only_with_context_2() -> None:
     loss.backward()
     assert model.blocks[0].mixer.signal_proj.weight_real.grad is not None
     for engine in model.blocks[0].mixer.cube_engines:
-        assert engine.prediction_proj.weight_real.grad is not None
-        assert engine.prediction_proj.weight_imag.grad is not None
+        _assert_prediction_projector_has_grad(engine.prediction_proj)
 
 
 def test_parallel_mixer_forward_and_backward() -> None:
@@ -2628,8 +2861,75 @@ def test_parallel_mixer_forward_and_backward() -> None:
     loss.backward()
     assert model.blocks[0].mixer.signal_proj.weight_real.grad is not None
     for engine in model.blocks[0].mixer.cube_engines:
-        assert engine.prediction_proj.weight_real.grad is not None
-        assert engine.prediction_proj.weight_imag.grad is not None
+        _assert_prediction_projector_has_grad(engine.prediction_proj)
+
+
+def test_parallel_mixer_forward_and_backward_with_spectral_reciprocation() -> None:
+    config = ModelConfig(
+        vocab_size=32,
+        max_seq_len=16,
+        dim=32,
+        n_layers=1,
+        n_heads=4,
+        state_rank=3,
+        state_mode_sizes=(3, 3, 3),
+        num_cube_engines=2,
+        normalization="frobenius",
+        dropout=0.0,
+        parallel_mixer=True,
+        use_spectral_reciprocation=True,
+        learnable_spectral_reciprocation=True,
+        spectral_mode="wavelet_packet_max_ultimate",
+    )
+    model = ReciprocatorOnlyLM(config)
+    inputs = torch.randint(0, 32, (2, 8))
+    targets = torch.randint(0, 32, (2, 8))
+
+    logits, loss = model(inputs, targets)
+    assert logits.shape == (2, 8, 32)
+    assert loss is not None
+    loss.backward()
+    assert model.blocks[0].mixer.signal_proj.weight_real.grad is not None
+    assert model.blocks[0].mixer.joint_spectral_mode is True
+    assert model.blocks[0].mixer.joint_spectral_reciprocator is not None
+    for engine in model.blocks[0].mixer.cube_engines:
+        assert engine.use_spectral_reciprocation is False
+        assert engine.learnable_spectral_reciprocation is True
+        assert engine.spectral_mode == "wavelet_packet_max_ultimate"
+        _assert_prediction_projector_has_grad(engine.prediction_proj)
+        assert engine.spectral_low_frequency_gain_raw is not None
+        assert engine.spectral_low_frequency_gain_raw.grad is not None
+
+
+def test_rank8_dynamic_profile_is_viable() -> None:
+    config = ModelConfig(
+        vocab_size=512,
+        max_seq_len=512,
+        dim=256,
+        n_layers=4,
+        n_heads=8,
+        state_rank=4,
+        max_state_rank=8,
+        dynamic_rank=True,
+        init_mode_sizes=(4, 4, 2, 2),
+        max_mode_sizes=(8, 8, 4, 4),
+        num_cube_engines=4,
+        normalization="frobenius",
+        dropout=0.05,
+    )
+    model = ReciprocatorOnlyLM(config)
+    params = sum(parameter.numel() for parameter in model.parameters())
+    inputs = torch.randint(0, config.vocab_size, (1, 2))
+    targets = torch.randint(0, config.vocab_size, (1, 2))
+
+    logits, loss = model(inputs, targets)
+    assert logits.shape == (1, 2, config.vocab_size)
+    assert loss is not None
+    loss.backward()
+
+    assert config.state_mode_sizes == (8, 8, 4, 4, 2, 2, 2, 2)
+    assert params < 60_000_000
+    assert model.blocks[0].mixer.signal_proj.weight_real.grad is not None
 
 
 def test_parallel_scan_linear_supports_time_varying_decay() -> None:

@@ -22,7 +22,7 @@ class ModelConfig:
     max_mode_sizes: Optional[Tuple[int, ...]] = None
     init_mode_sizes: Optional[Tuple[int, ...]] = None
     num_cube_engines: int = 4
-    normalization: str = "per_mode"
+    normalization: str = "frobenius"
     learned_per_mode_scaling: bool = False
     impression_rate: float = 0.35
     prediction_eta: float = 0.1
@@ -48,6 +48,21 @@ class ModelConfig:
     coupling_temperature: float = 1.0
     learnable_coupling_temperature: bool = False
     learned_normalization_blend: bool = False
+    use_spectral_reciprocation: bool = True
+    learnable_spectral_reciprocation: bool = True
+    spectral_mode: str = "wavelet_packet_max_ultimate"
+    joint_spectral_mode: Optional[bool] = None
+    spectral_low_frequency_gain: float = 0.15
+    spectral_low_frequency_sigma: float = 0.2
+    spectral_high_frequency_gain: float = 0.85
+    spectral_high_frequency_cutoff: float = 0.25
+    wavelet_name: str = "haar"
+    wavelet_levels: int = 3
+    wavelet_packet_best_basis: bool = True
+    wavelet_packet_prune_ratio: float = 1e-3
+    wavelet_packet_spectral_subtraction: bool = True
+    wavelet_packet_stationary: bool = True
+    wavelet_packet_cycle_spins: int = 2
     # Deprecated no-op, retained so older checkpoints/config payloads still load.
     training_growth_enabled: bool = False
 
@@ -78,6 +93,7 @@ class ModelConfig:
             value: Optional[Tuple[int, ...]],
             *,
             allow_initial_rank: bool = False,
+            pad_future_ranks: bool = False,
         ) -> Optional[Tuple[int, ...]]:
             if value is None:
                 return None
@@ -86,13 +102,19 @@ class ModelConfig:
                 raise ValueError(f"{name} must contain positive integers")
             if len(normalized) == self.max_state_rank:
                 return normalized
+            if pad_future_ranks and len(normalized) == self.state_rank and self.max_state_rank > self.state_rank:
+                return normalized + (2,) * (self.max_state_rank - self.state_rank)
             if allow_initial_rank and len(normalized) == self.state_rank:
                 return normalized + (1,) * (self.max_state_rank - self.state_rank)
             target = "max_state_rank" if not allow_initial_rank else "state_rank or max_state_rank"
             raise ValueError(f"{name} length must match {target}")
 
         explicit_mode_sizes = _validate_mode_sizes("state_mode_sizes", self.state_mode_sizes)
-        self.max_mode_sizes = _validate_mode_sizes("max_mode_sizes", self.max_mode_sizes)
+        self.max_mode_sizes = _validate_mode_sizes(
+            "max_mode_sizes",
+            self.max_mode_sizes,
+            pad_future_ranks=True,
+        )
         self.init_mode_sizes = _validate_mode_sizes(
             "init_mode_sizes",
             self.init_mode_sizes,
@@ -146,6 +168,37 @@ class ModelConfig:
             raise ValueError("prediction_eta must be non-negative")
         if self.coupling_temperature <= 0.0:
             raise ValueError("coupling_temperature must be positive")
+        if self.learnable_spectral_reciprocation and not self.use_spectral_reciprocation:
+            raise ValueError("learnable_spectral_reciprocation requires use_spectral_reciprocation=True")
+        if self.joint_spectral_mode is None:
+            self.joint_spectral_mode = self.use_spectral_reciprocation and self.num_cube_engines > 1
+        if self.spectral_mode not in {
+            "wavelet_packet_max_ultimate",
+            "wavelet_packet_max_gauge",
+            "wavelet_packet",
+            "dwt",
+            "fft",
+        }:
+            raise ValueError(
+                "spectral_mode must be 'wavelet_packet_max_ultimate', "
+                "'wavelet_packet_max_gauge', 'wavelet_packet', 'dwt', or 'fft'"
+            )
+        if self.spectral_low_frequency_gain < 0.0:
+            raise ValueError("spectral_low_frequency_gain must be non-negative")
+        if self.spectral_low_frequency_sigma <= 0.0:
+            raise ValueError("spectral_low_frequency_sigma must be positive")
+        if not 0.0 < self.spectral_high_frequency_gain <= 1.0:
+            raise ValueError("spectral_high_frequency_gain must be in (0, 1]")
+        if self.spectral_high_frequency_cutoff < 0.0:
+            raise ValueError("spectral_high_frequency_cutoff must be non-negative")
+        if self.wavelet_name not in {"haar", "db1"}:
+            raise ValueError("wavelet_name must be 'haar' or 'db1'")
+        if self.wavelet_levels <= 0:
+            raise ValueError("wavelet_levels must be positive")
+        if self.wavelet_packet_prune_ratio < 0.0:
+            raise ValueError("wavelet_packet_prune_ratio must be non-negative")
+        if self.wavelet_packet_cycle_spins <= 0:
+            raise ValueError("wavelet_packet_cycle_spins must be positive")
         if self.growth_threshold < 0.0:
             raise ValueError("growth_threshold must be non-negative")
         if self.growth_interval <= 0:

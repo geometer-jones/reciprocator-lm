@@ -13,7 +13,7 @@ def add_device_argument(parser: argparse.ArgumentParser, *, default: str = "cpu"
         "--device",
         choices=DEVICE_CHOICES,
         default=default,
-        help="Execution device. Defaults to cpu; use auto to prefer cuda or mps when available.",
+        help=f"Execution device. Defaults to {default}; use auto to prefer cuda or mps when available.",
     )
 
 

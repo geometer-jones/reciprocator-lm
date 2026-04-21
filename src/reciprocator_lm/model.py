@@ -53,6 +53,11 @@ def _inverse_softplus(value: float, *, eps: float = 1e-6) -> float:
     return math.log(math.expm1(clamped))
 
 
+def _inverse_sigmoid(value: float, *, eps: float = 1e-6) -> float:
+    clamped = min(max(float(value), eps), 1.0 - eps)
+    return math.log(clamped / (1.0 - clamped))
+
+
 def _normalize_complex(real: Tensor, imag: Tensor, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
     norm = torch.sqrt((real.square() + imag.square()).sum(dim=-1, keepdim=True).clamp_min(eps))
     return real / norm, imag / norm
@@ -350,6 +355,570 @@ def _mask_to_active(tensor: Tensor, active_sizes: tuple[int, ...], state_rank: i
     return masked
 
 
+def _spectral_frequency_radius_squared(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if not shape:
+        return torch.zeros((), dtype=dtype, device=device)
+    axes = [torch.fft.fftfreq(size, device=device).to(dtype=dtype) for size in shape]
+    radius_squared = torch.zeros(shape, dtype=dtype, device=device)
+    for axis in torch.meshgrid(*axes, indexing="ij"):
+        radius_squared = radius_squared + axis.square()
+    return radius_squared
+
+
+def _haar_wavelet_split(coefficients: Tensor) -> tuple[Tensor, Tensor, int]:
+    original_size = coefficients.size(-1)
+    if original_size <= 1:
+        raise ValueError("haar wavelet split requires at least two coefficients")
+    if original_size % 2 != 0:
+        pad_shape = (*coefficients.shape[:-1], 1)
+        coefficients = torch.cat((coefficients, coefficients.new_zeros(*pad_shape)), dim=-1)
+    even = coefficients[..., 0::2]
+    odd = coefficients[..., 1::2]
+    scale = math.sqrt(2.0)
+    low = (even + odd) / scale
+    high = (even - odd) / scale
+    return low, high, original_size
+
+
+def _haar_wavelet_merge(low: Tensor, high: Tensor, original_size: int) -> Tensor:
+    if low.shape != high.shape:
+        raise ValueError("haar wavelet merge requires matching low/high shapes")
+    scale = math.sqrt(2.0)
+    even = (low + high) / scale
+    odd = (low - high) / scale
+    restored = low.new_empty(*low.shape[:-1], low.size(-1) * 2)
+    restored[..., 0::2] = even
+    restored[..., 1::2] = odd
+    return restored[..., :original_size]
+
+
+def _spectral_mode_is_gauge_aware(mode: str) -> bool:
+    return mode in {"wavelet_packet_max_gauge", "wavelet_packet_max_ultimate"}
+
+
+class SpectralReciprocator(nn.Module):
+    """Multi-resolution spectral reciprocation over the active oscillator state."""
+
+    def __init__(
+        self,
+        *,
+        state_rank: int,
+        spectral_mode: str,
+        wavelet_name: str,
+        wavelet_levels: int,
+        wavelet_packet_best_basis: bool,
+        wavelet_packet_prune_ratio: float,
+        wavelet_packet_spectral_subtraction: bool,
+        wavelet_packet_stationary: bool,
+        wavelet_packet_cycle_spins: int,
+        packet_gain_hidden_dim: int = 12,
+    ) -> None:
+        super().__init__()
+        self.state_rank = state_rank
+        self.spectral_mode = spectral_mode
+        self.wavelet_name = wavelet_name
+        self.wavelet_levels = int(wavelet_levels)
+        self.wavelet_packet_best_basis = bool(wavelet_packet_best_basis)
+        self.wavelet_packet_prune_ratio = float(wavelet_packet_prune_ratio)
+        self.wavelet_packet_spectral_subtraction = bool(wavelet_packet_spectral_subtraction)
+        self.wavelet_packet_stationary = bool(wavelet_packet_stationary)
+        self.wavelet_packet_cycle_spins = int(wavelet_packet_cycle_spins)
+        self.packet_gain_proj = nn.Linear(7, packet_gain_hidden_dim)
+        self.packet_gain_out = nn.Linear(packet_gain_hidden_dim, 2)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.packet_gain_proj.weight)
+        nn.init.zeros_(self.packet_gain_proj.bias)
+        nn.init.zeros_(self.packet_gain_out.weight)
+        nn.init.zeros_(self.packet_gain_out.bias)
+
+    def _fft_filter(
+        self,
+        reference: Tensor,
+        active_sizes: tuple[int, ...],
+        *,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        radius_squared = _spectral_frequency_radius_squared(
+            tuple(int(size) for size in active_sizes),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        low_frequency_boost = 1.0 + low_frequency_gain * torch.exp(-radius_squared / sigma.square())
+        radius = torch.sqrt(radius_squared + 1e-12)
+        smoothing_width = sigma.clamp_min(5e-2)
+        low_band_gate = torch.sigmoid((cutoff - radius) / smoothing_width)
+        high_frequency_damping = high_frequency_gain + (1.0 - high_frequency_gain) * low_band_gate
+        return low_frequency_boost * high_frequency_damping
+
+    def _phase_coherence(self, coefficients: Tensor, global_phase_unit: Tensor) -> Tensor:
+        unit = coefficients / coefficients.abs().clamp_min(1e-6)
+        coherence = (unit * global_phase_unit.conj()).mean(dim=-1, keepdim=True).abs()
+        return coherence.clamp(0.0, 1.0)
+
+    def _packet_cost(self, coefficients: Tensor, global_phase_unit: Tensor) -> float:
+        if coefficients.size(-1) <= 1:
+            return 0.0
+        energy = coefficients.abs().square()
+        total = energy.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        probabilities = (energy / total).clamp_min(1e-6)
+        entropy = -(probabilities * probabilities.log()).sum(dim=-1)
+        if not _spectral_mode_is_gauge_aware(self.spectral_mode):
+            return float(entropy.mean().detach().item())
+        coherence = self._phase_coherence(coefficients, global_phase_unit)
+        gauge_cost = entropy + (1.0 - coherence.squeeze(-1))
+        return float(gauge_cost.mean().detach().item())
+
+    def _packet_band_center(self, path: tuple[int, ...]) -> float:
+        if not path:
+            return 0.0
+        band_index = 0
+        for bit in path:
+            band_index = (band_index << 1) | int(bit)
+        return (band_index + 0.5) / (2 ** len(path))
+
+    def _complex_leaf_gain(
+        self,
+        coefficients: Tensor,
+        *,
+        path: tuple[int, ...],
+        depth: int,
+        global_phase_unit: Tensor,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        magnitude = coefficients.abs().clamp_min(1e-6)
+        phase = torch.atan2(coefficients.imag, coefficients.real) / math.pi
+        node_log_energy = torch.log(coefficients.abs().square().mean(dim=-1, keepdim=True).clamp_min(1e-6))
+        node_log_energy = node_log_energy.expand_as(magnitude)
+        depth_norm = magnitude.new_full(magnitude.shape, depth / max(1, self.wavelet_levels))
+        band_center = magnitude.new_full(magnitude.shape, self._packet_band_center(path))
+        coherence = self._phase_coherence(coefficients, global_phase_unit).expand_as(magnitude)
+        position = torch.linspace(
+            0.0,
+            1.0,
+            steps=coefficients.size(-1),
+            dtype=magnitude.dtype,
+            device=magnitude.device,
+        ).view(*([1] * (coefficients.ndim - 1)), coefficients.size(-1))
+        position = position.expand_as(magnitude)
+        features = torch.stack(
+            (
+                torch.log(magnitude),
+                phase,
+                node_log_energy,
+                depth_norm,
+                band_center,
+                coherence,
+                position,
+            ),
+            dim=-1,
+        )
+        gain_delta = self.packet_gain_out(F.silu(self.packet_gain_proj(features)))
+        delta_magnitude = 0.25 * torch.tanh(gain_delta[..., 0])
+        delta_phase = 0.5 * math.pi * torch.tanh(gain_delta[..., 1])
+
+        low_band_boost = 1.0 + low_frequency_gain * torch.exp(-(band_center.square()) / sigma.square())
+        high_band_damping = high_frequency_gain + (1.0 - high_frequency_gain) * torch.sigmoid(
+            (cutoff - band_center) / sigma
+        )
+        coherence_boost = 1.0 + low_frequency_gain * coherence
+        coherence_damping = high_frequency_gain + (1.0 - high_frequency_gain) * coherence
+        gain_magnitude = low_band_boost * high_band_damping * coherence_boost * coherence_damping * torch.exp(
+            delta_magnitude
+        )
+        return torch.polar(gain_magnitude, delta_phase.to(dtype=magnitude.dtype))
+
+    def _filter_leaf(
+        self,
+        coefficients: Tensor,
+        *,
+        path: tuple[int, ...],
+        depth: int,
+        total_energy: float,
+        global_phase_unit: Tensor,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        if coefficients.numel() == 0:
+            return coefficients
+        node_energy = float(coefficients.abs().square().sum().detach().item())
+        energy_ratio = 0.0 if total_energy <= 0.0 else node_energy / total_energy
+        filtered = coefficients * self._complex_leaf_gain(
+            coefficients,
+            path=path,
+            depth=depth,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        coherence_value = float(self._phase_coherence(coefficients, global_phase_unit).mean().detach().item())
+        if self.wavelet_packet_spectral_subtraction:
+            filtered_magnitude = filtered.abs()
+            noise_floor = filtered_magnitude.median(dim=-1, keepdim=True).values
+            damping = high_frequency_gain + (1.0 - high_frequency_gain) * torch.sigmoid(
+                (cutoff - filtered_magnitude.new_tensor(self._packet_band_center(path))) / sigma
+            )
+            denoised_magnitude = torch.relu(filtered_magnitude - (1.0 - damping) * noise_floor)
+            unit = filtered / filtered_magnitude.clamp_min(1e-6)
+            filtered = denoised_magnitude * unit
+        if energy_ratio < self.wavelet_packet_prune_ratio or coherence_value < self.wavelet_packet_prune_ratio:
+            filtered = filtered * high_frequency_gain.square()
+        return filtered
+
+    def _apply_packet_node(
+        self,
+        coefficients: Tensor,
+        *,
+        depth: int,
+        path: tuple[int, ...],
+        max_depth: int,
+        total_energy: float,
+        global_phase_unit: Tensor,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> tuple[Tensor, float]:
+        leaf_cost = self._packet_cost(coefficients, global_phase_unit)
+        leaf = self._filter_leaf(
+            coefficients,
+            path=path,
+            depth=depth,
+            total_energy=total_energy,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        if depth >= max_depth or coefficients.size(-1) <= 1:
+            return leaf, leaf_cost
+
+        low, high, original_size = _haar_wavelet_split(coefficients)
+        low_reconstructed, low_cost = self._apply_packet_node(
+            low,
+            depth=depth + 1,
+            path=path + (0,),
+            max_depth=max_depth,
+            total_energy=total_energy,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        high_reconstructed, high_cost = self._apply_packet_node(
+            high,
+            depth=depth + 1,
+            path=path + (1,),
+            max_depth=max_depth,
+            total_energy=total_energy,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        split_cost = low_cost + high_cost
+        if self.wavelet_packet_best_basis and split_cost >= leaf_cost:
+            return leaf, leaf_cost
+        return _haar_wavelet_merge(low_reconstructed, high_reconstructed, original_size), split_cost
+
+    def _apply_dwt_node(
+        self,
+        coefficients: Tensor,
+        *,
+        depth: int,
+        path: tuple[int, ...],
+        max_depth: int,
+        total_energy: float,
+        global_phase_unit: Tensor,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        if depth >= max_depth or coefficients.size(-1) <= 1:
+            return self._filter_leaf(
+                coefficients,
+                path=path,
+                depth=depth,
+                total_energy=total_energy,
+                global_phase_unit=global_phase_unit,
+                low_frequency_gain=low_frequency_gain,
+                sigma=sigma,
+                high_frequency_gain=high_frequency_gain,
+                cutoff=cutoff,
+            )
+        low, high, original_size = _haar_wavelet_split(coefficients)
+        filtered_low = self._apply_dwt_node(
+            low,
+            depth=depth + 1,
+            path=path + (0,),
+            max_depth=max_depth,
+            total_energy=total_energy,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        filtered_high = self._filter_leaf(
+            high,
+            path=path + (1,),
+            depth=depth + 1,
+            total_energy=total_energy,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        return _haar_wavelet_merge(filtered_low, filtered_high, original_size)
+
+    def _apply_wavelet_once(
+        self,
+        flat_state: Tensor,
+        *,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        if flat_state.size(-1) <= 1:
+            return flat_state
+        total_energy = float(flat_state.abs().square().sum().detach().item())
+        global_phase = flat_state.mean(dim=-1, keepdim=True)
+        global_phase_unit = global_phase / global_phase.abs().clamp_min(1e-6)
+        max_depth = min(self.wavelet_levels, max(1, int(math.ceil(math.log2(flat_state.size(-1))))))
+        if self.spectral_mode == "dwt":
+            return self._apply_dwt_node(
+                flat_state,
+                depth=0,
+                path=(),
+                max_depth=max_depth,
+                total_energy=total_energy,
+                global_phase_unit=global_phase_unit,
+                low_frequency_gain=low_frequency_gain,
+                sigma=sigma,
+                high_frequency_gain=high_frequency_gain,
+                cutoff=cutoff,
+            )
+        filtered, _ = self._apply_packet_node(
+            flat_state,
+            depth=0,
+            path=(),
+            max_depth=max_depth,
+            total_energy=total_energy,
+            global_phase_unit=global_phase_unit,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+        return filtered
+
+    def _apply_wavelet(
+        self,
+        state: Tensor,
+        *,
+        active_rank: int,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        batch_dims = state.ndim - self.state_rank
+        flat_state = state.reshape(*state.shape[:batch_dims], -1)
+        if not self.wavelet_packet_stationary:
+            reciprocated = self._apply_wavelet_once(
+                flat_state,
+                low_frequency_gain=low_frequency_gain,
+                sigma=sigma,
+                high_frequency_gain=high_frequency_gain,
+                cutoff=cutoff,
+            )
+            return reciprocated.reshape_as(state)
+
+        cycle_spins = min(self.wavelet_packet_cycle_spins, max(1, flat_state.size(-1)))
+        reciprocated = flat_state.new_zeros(flat_state.shape)
+        for shift in range(cycle_spins):
+            shifted = torch.roll(flat_state, shifts=shift, dims=-1)
+            filtered = self._apply_wavelet_once(
+                shifted,
+                low_frequency_gain=low_frequency_gain,
+                sigma=sigma,
+                high_frequency_gain=high_frequency_gain,
+                cutoff=cutoff,
+            )
+            reciprocated = reciprocated + torch.roll(filtered, shifts=-shift, dims=-1)
+        reciprocated = reciprocated / cycle_spins
+        return reciprocated.reshape_as(state)
+
+    def forward(
+        self,
+        state: Tensor,
+        *,
+        active_sizes: tuple[int, ...],
+        active_rank: int,
+        low_frequency_gain: Tensor,
+        sigma: Tensor,
+        high_frequency_gain: Tensor,
+        cutoff: Tensor,
+    ) -> Tensor:
+        if self.spectral_mode == "fft":
+            batch_dims = state.ndim - self.state_rank
+            fft_dims = tuple(range(batch_dims, batch_dims + active_rank))
+            if not fft_dims:
+                return state
+            spectrum = torch.fft.fftn(state, dim=fft_dims)
+            spectral_filter = self._fft_filter(
+                state.real,
+                active_sizes[:active_rank],
+                low_frequency_gain=low_frequency_gain,
+                sigma=sigma,
+                high_frequency_gain=high_frequency_gain,
+                cutoff=cutoff,
+            ).view(*([1] * batch_dims), *active_sizes[:active_rank])
+            for _ in range(self.state_rank - active_rank):
+                spectral_filter = spectral_filter.unsqueeze(-1)
+            return torch.fft.ifftn(spectrum * spectral_filter, dim=fft_dims)
+        return self._apply_wavelet(
+            state,
+            active_rank=active_rank,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+
+
+def _flatten_active_complex_state(
+    state: Tensor,
+    *,
+    active_sizes: tuple[int, ...],
+    state_rank: int,
+) -> Tensor:
+    batch_dims = state.ndim - state_rank
+    active_slice = (slice(None),) * batch_dims + _active_slice(active_sizes)
+    return state[active_slice].reshape(*state.shape[:batch_dims], -1)
+
+
+def _restore_active_complex_state(
+    flat_state: Tensor,
+    *,
+    template: Tensor,
+    active_sizes: tuple[int, ...],
+    state_rank: int,
+) -> Tensor:
+    restored = template.new_zeros(template.shape)
+    batch_dims = template.ndim - state_rank
+    active_slice = (slice(None),) * batch_dims + _active_slice(active_sizes)
+    restored[active_slice] = flat_state.reshape(*template.shape[:batch_dims], *active_sizes)
+    return restored
+
+
+def _mean_engine_spectral_parameters(
+    cube_engines,
+    *,
+    reference: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    low_frequency_gain = torch.stack(
+        [engine._spectral_low_frequency_gain_tensor(reference) for engine in cube_engines],
+        dim=0,
+    ).mean(dim=0)
+    sigma = torch.stack(
+        [engine._spectral_low_frequency_sigma_tensor(reference).clamp_min(1e-6) for engine in cube_engines],
+        dim=0,
+    ).mean(dim=0)
+    high_frequency_gain = torch.stack(
+        [engine._spectral_high_frequency_gain_tensor(reference) for engine in cube_engines],
+        dim=0,
+    ).mean(dim=0)
+    cutoff = torch.stack(
+        [engine._spectral_high_frequency_cutoff_tensor(reference) for engine in cube_engines],
+        dim=0,
+    ).mean(dim=0)
+    return low_frequency_gain, sigma, high_frequency_gain, cutoff
+
+
+def _apply_joint_engine_spectral_reciprocation(
+    reciprocator: SpectralReciprocator,
+    *,
+    state_reals: list[Tensor],
+    state_imags: list[Tensor],
+    state_rank: int,
+    active_sizes: tuple[int, ...],
+    low_frequency_gain: Tensor,
+    sigma: Tensor,
+    high_frequency_gain: Tensor,
+    cutoff: Tensor,
+) -> tuple[list[Tensor], list[Tensor]]:
+    if len(state_reals) != len(state_imags):
+        raise ValueError("state_reals and state_imags must contain the same number of engines")
+    if not state_reals:
+        return state_reals, state_imags
+
+    joint_chunks = []
+    for state_real, state_imag in zip(state_reals, state_imags):
+        joint_chunks.append(
+            _flatten_active_complex_state(
+                torch.complex(state_real, state_imag),
+                active_sizes=active_sizes,
+                state_rank=state_rank,
+            )
+        )
+    joint_state = torch.cat(joint_chunks, dim=-1)
+    joint_state = reciprocator(
+        joint_state,
+        active_sizes=(joint_state.size(-1),),
+        active_rank=1,
+        low_frequency_gain=low_frequency_gain,
+        sigma=sigma,
+        high_frequency_gain=high_frequency_gain,
+        cutoff=cutoff,
+    )
+    joint_real, joint_imag = _normalize_complex_tensor(
+        joint_state.real,
+        joint_state.imag,
+        "frobenius",
+        state_rank=1,
+        active_rank=1,
+    )
+    joint_state = torch.complex(joint_real, joint_imag)
+
+    chunk_width = joint_chunks[0].size(-1)
+    reciprocated_chunks = joint_state.split(chunk_width, dim=-1)
+    next_reals: list[Tensor] = []
+    next_imags: list[Tensor] = []
+    for state_real, state_imag, chunk in zip(state_reals, state_imags, reciprocated_chunks):
+        restored = _restore_active_complex_state(
+            chunk,
+            template=torch.complex(state_real, state_imag),
+            active_sizes=active_sizes,
+            state_rank=state_rank,
+        )
+        next_reals.append(restored.real)
+        next_imags.append(restored.imag)
+    return next_reals, next_imags
+
+
 def _relational_product(
     signal_real: Tensor,
     signal_imag: Tensor,
@@ -437,6 +1006,88 @@ def _summarize_complex_tensor(
             (masked_real.sum(dim=dims, keepdim=False) / active_count).unsqueeze(-1),
             (masked_imag.sum(dim=dims, keepdim=False) / active_count).unsqueeze(-1),
             (magnitude.sum(dim=dims, keepdim=False) / active_count).unsqueeze(-1),
+        ),
+        dim=-1,
+    )
+
+
+def _mode_energy_summary(
+    magnitude: Tensor,
+    *,
+    active_sizes: tuple[int, ...],
+    state_rank: int,
+    active_rank: Optional[int] = None,
+) -> Tensor:
+    batch_dims = magnitude.ndim - state_rank
+    reduce_dims = tuple(range(batch_dims, magnitude.ndim))
+    active_count = float(max(1, math.prod(int(size) for size in active_sizes)))
+    effective_active_rank = state_rank if active_rank is None else int(active_rank)
+    magnitude_sq = magnitude.square()
+    mode_energy_stats = []
+    for mode_idx, active_size in enumerate(active_sizes):
+        if mode_idx >= effective_active_rank:
+            leading_shape = magnitude.shape[:batch_dims]
+            mode_energy_stats.append(torch.zeros(*leading_shape, dtype=magnitude.dtype, device=magnitude.device))
+            continue
+        axis = batch_dims + mode_idx
+        other_dims = tuple(dim for dim in reduce_dims if dim != axis)
+        other_count = float(active_count / max(1, int(active_size)))
+        if other_dims:
+            fiber_energy = magnitude_sq.sum(dim=other_dims) / other_count
+        else:
+            fiber_energy = magnitude_sq
+        mode_energy_stats.append(torch.sqrt(fiber_energy.square().mean(dim=-1) + 1e-8))
+    return torch.stack(mode_energy_stats, dim=-1)
+
+
+def _engine_state_readout_features(
+    state_real: Tensor,
+    state_imag: Tensor,
+    magnitude_accumulator: Tensor,
+    *,
+    active_sizes: tuple[int, ...],
+    state_rank: int,
+    active_rank: Optional[int] = None,
+) -> Tensor:
+    accumulator_imag = torch.zeros_like(magnitude_accumulator)
+    state_summary = _summarize_complex_tensor(
+        state_real,
+        state_imag,
+        active_sizes=active_sizes,
+        state_rank=state_rank,
+        active_rank=active_rank,
+    )
+    accumulator_summary = _summarize_complex_tensor(
+        magnitude_accumulator,
+        accumulator_imag,
+        active_sizes=active_sizes,
+        state_rank=state_rank,
+        active_rank=active_rank,
+    )
+    state_magnitude = _mask_to_active(
+        torch.sqrt(state_real.square() + state_imag.square() + 1e-6),
+        active_sizes,
+        state_rank,
+    )
+    accumulator_magnitude = _mask_to_active(magnitude_accumulator.abs(), active_sizes, state_rank)
+    state_mode_energy = _mode_energy_summary(
+        state_magnitude,
+        active_sizes=active_sizes,
+        state_rank=state_rank,
+        active_rank=active_rank,
+    )
+    accumulator_mode_energy = _mode_energy_summary(
+        accumulator_magnitude,
+        active_sizes=active_sizes,
+        state_rank=state_rank,
+        active_rank=active_rank,
+    )
+    return torch.cat(
+        (
+            state_summary,
+            accumulator_summary,
+            state_mode_energy,
+            accumulator_mode_energy,
         ),
         dim=-1,
     )
@@ -763,6 +1414,105 @@ def _gain_predictor_post_load_hook(module: nn.Module, incompatible_keys: nn.modu
     ]
 
 
+class _ModewisePredictionProjector(nn.Module):
+    """Complex separable prediction transport over tensor modes."""
+
+    def __init__(self, state_mode_sizes: tuple[int, ...]) -> None:
+        super().__init__()
+        self.state_mode_sizes = state_mode_sizes
+        self.weight_real = nn.ParameterList(
+            [nn.Parameter(torch.zeros(mode_size, mode_size)) for mode_size in state_mode_sizes]
+        )
+        self.weight_imag = nn.ParameterList(
+            [nn.Parameter(torch.zeros(mode_size, mode_size)) for mode_size in state_mode_sizes]
+        )
+
+    def zero_(self) -> None:
+        with torch.no_grad():
+            for weight_real, weight_imag in zip(self.weight_real, self.weight_imag):
+                weight_real.zero_()
+                weight_imag.zero_()
+
+    def set_identity_(self) -> None:
+        self.zero_()
+        with torch.no_grad():
+            for weight_real in self.weight_real:
+                size = weight_real.shape[0]
+                weight_real.copy_(torch.eye(size, dtype=weight_real.dtype, device=weight_real.device))
+
+    def _complex_identity(
+        self,
+        *,
+        mode_size: int,
+        batch_shape: tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        eye = torch.eye(mode_size, dtype=_complex_dtype_for(dtype), device=device)
+        return eye.expand(*batch_shape, mode_size, mode_size)
+
+    def couplings(
+        self,
+        reference_real: Tensor,
+        *,
+        active_sizes: tuple[int, ...],
+        state_rank: int,
+        active_rank: Optional[int] = None,
+    ) -> list[Tensor]:
+        batch_dims = reference_real.ndim - state_rank
+        batch_shape = reference_real.shape[:batch_dims]
+        resolved_active_rank = state_rank if active_rank is None else int(active_rank)
+        couplings: list[Tensor] = []
+        for mode_idx, mode_size in enumerate(self.state_mode_sizes):
+            if mode_idx >= resolved_active_rank:
+                couplings.append(
+                    self._complex_identity(
+                        mode_size=mode_size,
+                        batch_shape=batch_shape,
+                        device=reference_real.device,
+                        dtype=reference_real.dtype,
+                    )
+                )
+                continue
+            active_mode = int(active_sizes[mode_idx])
+            coupling = torch.zeros(
+                *batch_shape,
+                mode_size,
+                mode_size,
+                dtype=_complex_dtype_for(reference_real.dtype),
+                device=reference_real.device,
+            )
+            weight_real = self.weight_real[mode_idx][:active_mode, :active_mode].to(
+                dtype=reference_real.dtype,
+                device=reference_real.device,
+            )
+            weight_imag = self.weight_imag[mode_idx][:active_mode, :active_mode].to(
+                dtype=reference_real.dtype,
+                device=reference_real.device,
+            )
+            coupling[..., :active_mode, :active_mode] = torch.complex(weight_real, weight_imag)
+            couplings.append(coupling)
+        return couplings
+
+    def forward(
+        self,
+        real: Tensor,
+        imag: Tensor,
+        *,
+        active_sizes: tuple[int, ...],
+        state_rank: int,
+        active_rank: Optional[int] = None,
+    ) -> tuple[Tensor, Tensor]:
+        couplings = self.couplings(
+            real,
+            active_sizes=active_sizes,
+            state_rank=state_rank,
+            active_rank=active_rank,
+        )
+        projected = _apply_mode_couplings(torch.complex(real, imag), couplings, state_rank)
+        return projected.real, projected.imag
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -827,6 +1577,21 @@ class _CubeEngineCell(nn.Module):
         phase_aware_coupling: bool = True,
         coupling_temperature: float = 1.0,
         learnable_coupling_temperature: bool = False,
+        use_spectral_reciprocation: bool = False,
+        learnable_spectral_reciprocation: bool = False,
+        spectral_mode: str = "wavelet_packet_max_ultimate",
+        joint_spectral_mode: Optional[bool] = None,
+        spectral_low_frequency_gain: float = 0.15,
+        spectral_low_frequency_sigma: float = 0.2,
+        spectral_high_frequency_gain: float = 0.85,
+        spectral_high_frequency_cutoff: float = 0.25,
+        wavelet_name: str = "haar",
+        wavelet_levels: int = 3,
+        wavelet_packet_best_basis: bool = True,
+        wavelet_packet_prune_ratio: float = 1e-3,
+        wavelet_packet_spectral_subtraction: bool = True,
+        wavelet_packet_stationary: bool = True,
+        wavelet_packet_cycle_spins: int = 2,
         adaptive_growth_controls: bool = False,
     ) -> None:
         super().__init__()
@@ -853,6 +1618,51 @@ class _CubeEngineCell(nn.Module):
             else None
         )
         self._fixed_coupling_temperature = float(coupling_temperature)
+        self.use_spectral_reciprocation = bool(use_spectral_reciprocation)
+        self.learnable_spectral_reciprocation = bool(learnable_spectral_reciprocation)
+        self.spectral_mode = spectral_mode
+        self.spectral_low_frequency_gain_raw = (
+            nn.Parameter(torch.tensor(_inverse_softplus(spectral_low_frequency_gain), dtype=torch.float32))
+            if self.learnable_spectral_reciprocation
+            else None
+        )
+        self._fixed_spectral_low_frequency_gain = float(spectral_low_frequency_gain)
+        self.spectral_low_frequency_sigma_raw = (
+            nn.Parameter(torch.tensor(_inverse_softplus(spectral_low_frequency_sigma), dtype=torch.float32))
+            if self.learnable_spectral_reciprocation
+            else None
+        )
+        self._fixed_spectral_low_frequency_sigma = float(spectral_low_frequency_sigma)
+        self.spectral_high_frequency_gain_raw = (
+            nn.Parameter(torch.tensor(_inverse_sigmoid(spectral_high_frequency_gain), dtype=torch.float32))
+            if self.learnable_spectral_reciprocation
+            else None
+        )
+        self._fixed_spectral_high_frequency_gain = float(spectral_high_frequency_gain)
+        self.spectral_high_frequency_cutoff_raw = (
+            nn.Parameter(torch.tensor(_inverse_softplus(spectral_high_frequency_cutoff), dtype=torch.float32))
+            if self.learnable_spectral_reciprocation
+            else None
+        )
+        self._fixed_spectral_high_frequency_cutoff = float(spectral_high_frequency_cutoff)
+        self.wavelet_name = wavelet_name
+        self.wavelet_levels = int(wavelet_levels)
+        self.wavelet_packet_best_basis = bool(wavelet_packet_best_basis)
+        self.wavelet_packet_prune_ratio = float(wavelet_packet_prune_ratio)
+        self.wavelet_packet_spectral_subtraction = bool(wavelet_packet_spectral_subtraction)
+        self.wavelet_packet_stationary = bool(wavelet_packet_stationary)
+        self.wavelet_packet_cycle_spins = int(wavelet_packet_cycle_spins)
+        self.spectral_reciprocator = SpectralReciprocator(
+            state_rank=self.state_rank,
+            spectral_mode=self.spectral_mode,
+            wavelet_name=self.wavelet_name,
+            wavelet_levels=self.wavelet_levels,
+            wavelet_packet_best_basis=self.wavelet_packet_best_basis,
+            wavelet_packet_prune_ratio=self.wavelet_packet_prune_ratio,
+            wavelet_packet_spectral_subtraction=self.wavelet_packet_spectral_subtraction,
+            wavelet_packet_stationary=self.wavelet_packet_stationary,
+            wavelet_packet_cycle_spins=self.wavelet_packet_cycle_spins,
+        )
         self.adaptive_growth_controls = bool(adaptive_growth_controls)
         self._nominal_growth_threshold = float(growth_threshold)
         self.growth_interval = growth_interval
@@ -885,9 +1695,7 @@ class _CubeEngineCell(nn.Module):
         self.cpl_proj_imag = nn.ParameterList(
             [nn.Parameter(torch.zeros(mode_size, mode_size)) for mode_size in max_mode_sizes]
         )
-        self.prediction_proj = ComplexLinear(self.state_dim, self.state_dim)
-        nn.init.zeros_(self.prediction_proj.weight_real)
-        nn.init.zeros_(self.prediction_proj.weight_imag)
+        self.prediction_proj = _ModewisePredictionProjector(self.state_mode_sizes)
         # Keep anticipation in the same geometric language as the update:
         # self-state continuation plus phase-aware self-transport under the
         # learned mode couplings. Zero init preserves legacy behavior.
@@ -936,6 +1744,35 @@ class _CubeEngineCell(nn.Module):
             prefix,
             "coupling_temperature_raw",
         )
+        _prepare_optional_parameter_state_dict(
+            self.spectral_low_frequency_gain_raw,
+            state_dict,
+            prefix,
+            "spectral_low_frequency_gain_raw",
+        )
+        _prepare_optional_parameter_state_dict(
+            self.spectral_low_frequency_sigma_raw,
+            state_dict,
+            prefix,
+            "spectral_low_frequency_sigma_raw",
+        )
+        _prepare_optional_parameter_state_dict(
+            self.spectral_high_frequency_gain_raw,
+            state_dict,
+            prefix,
+            "spectral_high_frequency_gain_raw",
+        )
+        _prepare_optional_parameter_state_dict(
+            self.spectral_high_frequency_cutoff_raw,
+            state_dict,
+            prefix,
+            "spectral_high_frequency_cutoff_raw",
+        )
+        legacy_prediction_weight_real_key = prefix + "prediction_proj.weight_real"
+        legacy_prediction_weight_imag_key = prefix + "prediction_proj.weight_imag"
+        had_legacy_prediction_proj = (
+            legacy_prediction_weight_real_key in state_dict or legacy_prediction_weight_imag_key in state_dict
+        )
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -947,10 +1784,34 @@ class _CubeEngineCell(nn.Module):
         )
         prediction_eta_key = prefix + "prediction_eta_raw"
         coupling_temperature_key = prefix + "coupling_temperature_raw"
+        spectral_low_frequency_gain_key = prefix + "spectral_low_frequency_gain_raw"
+        spectral_low_frequency_sigma_key = prefix + "spectral_low_frequency_sigma_raw"
+        spectral_high_frequency_gain_key = prefix + "spectral_high_frequency_gain_raw"
+        spectral_high_frequency_cutoff_key = prefix + "spectral_high_frequency_cutoff_raw"
         if self.prediction_eta_raw is None:
             unexpected_keys[:] = [key for key in unexpected_keys if key != prediction_eta_key]
         if self.coupling_temperature_raw is None:
             unexpected_keys[:] = [key for key in unexpected_keys if key != coupling_temperature_key]
+        if self.spectral_low_frequency_gain_raw is None:
+            unexpected_keys[:] = [key for key in unexpected_keys if key != spectral_low_frequency_gain_key]
+        if self.spectral_low_frequency_sigma_raw is None:
+            unexpected_keys[:] = [key for key in unexpected_keys if key != spectral_low_frequency_sigma_key]
+        if self.spectral_high_frequency_gain_raw is None:
+            unexpected_keys[:] = [key for key in unexpected_keys if key != spectral_high_frequency_gain_key]
+        if self.spectral_high_frequency_cutoff_raw is None:
+            unexpected_keys[:] = [key for key in unexpected_keys if key != spectral_high_frequency_cutoff_key]
+        unexpected_keys[:] = [
+            key
+            for key in unexpected_keys
+            if key not in {legacy_prediction_weight_real_key, legacy_prediction_weight_imag_key}
+        ]
+        if had_legacy_prediction_proj:
+            missing_keys[:] = [
+                key
+                for key in missing_keys
+                if not key.startswith(prefix + "prediction_proj.weight_real.")
+                and not key.startswith(prefix + "prediction_proj.weight_imag.")
+            ]
 
     @property
     def prediction_eta(self) -> float:
@@ -973,6 +1834,50 @@ class _CubeEngineCell(nn.Module):
         if self.coupling_temperature_raw is None:
             return reference.new_tensor(self._fixed_coupling_temperature)
         return F.softplus(self.coupling_temperature_raw).to(dtype=reference.dtype, device=reference.device)
+
+    @property
+    def spectral_low_frequency_gain(self) -> float:
+        if self.spectral_low_frequency_gain_raw is None:
+            return self._fixed_spectral_low_frequency_gain
+        return float(F.softplus(self.spectral_low_frequency_gain_raw.detach()).item())
+
+    def _spectral_low_frequency_gain_tensor(self, reference: Tensor) -> Tensor:
+        if self.spectral_low_frequency_gain_raw is None:
+            return reference.new_tensor(self._fixed_spectral_low_frequency_gain)
+        return F.softplus(self.spectral_low_frequency_gain_raw).to(dtype=reference.dtype, device=reference.device)
+
+    @property
+    def spectral_low_frequency_sigma(self) -> float:
+        if self.spectral_low_frequency_sigma_raw is None:
+            return self._fixed_spectral_low_frequency_sigma
+        return float(F.softplus(self.spectral_low_frequency_sigma_raw.detach()).item())
+
+    def _spectral_low_frequency_sigma_tensor(self, reference: Tensor) -> Tensor:
+        if self.spectral_low_frequency_sigma_raw is None:
+            return reference.new_tensor(self._fixed_spectral_low_frequency_sigma)
+        return F.softplus(self.spectral_low_frequency_sigma_raw).to(dtype=reference.dtype, device=reference.device)
+
+    @property
+    def spectral_high_frequency_gain(self) -> float:
+        if self.spectral_high_frequency_gain_raw is None:
+            return self._fixed_spectral_high_frequency_gain
+        return float(torch.sigmoid(self.spectral_high_frequency_gain_raw.detach()).item())
+
+    def _spectral_high_frequency_gain_tensor(self, reference: Tensor) -> Tensor:
+        if self.spectral_high_frequency_gain_raw is None:
+            return reference.new_tensor(self._fixed_spectral_high_frequency_gain)
+        return torch.sigmoid(self.spectral_high_frequency_gain_raw).to(dtype=reference.dtype, device=reference.device)
+
+    @property
+    def spectral_high_frequency_cutoff(self) -> float:
+        if self.spectral_high_frequency_cutoff_raw is None:
+            return self._fixed_spectral_high_frequency_cutoff
+        return float(F.softplus(self.spectral_high_frequency_cutoff_raw.detach()).item())
+
+    def _spectral_high_frequency_cutoff_tensor(self, reference: Tensor) -> Tensor:
+        if self.spectral_high_frequency_cutoff_raw is None:
+            return reference.new_tensor(self._fixed_spectral_high_frequency_cutoff)
+        return F.softplus(self.spectral_high_frequency_cutoff_raw).to(dtype=reference.dtype, device=reference.device)
 
     @property
     def growth_threshold(self) -> float:
@@ -1197,6 +2102,20 @@ class _CubeEngineCell(nn.Module):
             "accumulator_modulates_gains": self.accumulator_modulates_gains,
             "prediction_eta": self.prediction_eta,
             "coupling_temperature": self.coupling_temperature,
+            "use_spectral_reciprocation": self.use_spectral_reciprocation,
+            "learnable_spectral_reciprocation": self.learnable_spectral_reciprocation,
+            "spectral_mode": self.spectral_mode,
+            "spectral_low_frequency_gain": self.spectral_low_frequency_gain,
+            "spectral_low_frequency_sigma": self.spectral_low_frequency_sigma,
+            "spectral_high_frequency_gain": self.spectral_high_frequency_gain,
+            "spectral_high_frequency_cutoff": self.spectral_high_frequency_cutoff,
+            "wavelet_name": self.wavelet_name,
+            "wavelet_levels": self.wavelet_levels,
+            "wavelet_packet_best_basis": self.wavelet_packet_best_basis,
+            "wavelet_packet_prune_ratio": self.wavelet_packet_prune_ratio,
+            "wavelet_packet_spectral_subtraction": self.wavelet_packet_spectral_subtraction,
+            "wavelet_packet_stationary": self.wavelet_packet_stationary,
+            "wavelet_packet_cycle_spins": self.wavelet_packet_cycle_spins,
             "growth_threshold": self.growth_threshold,
             "prune_floor": self.prune_floor,
             "prune_horizon": self.prune_horizon,
@@ -1220,12 +2139,13 @@ class _CubeEngineCell(nn.Module):
         state_real = _mask_to_active(state_real, active_sizes, self.state_rank)
         state_imag = _mask_to_active(state_imag, active_sizes, self.state_rank)
         magnitude_accumulator = _mask_to_active(magnitude_accumulator, active_sizes, self.state_rank)
-        leading_shape = state_real.shape[: state_real.ndim - self.state_rank]
-        flat_real = state_real.reshape(-1, self.state_dim)
-        flat_imag = state_imag.reshape(-1, self.state_dim)
-        predicted = self.prediction_proj(torch.complex(flat_real, flat_imag))
-        predicted_real = predicted.real.view(*leading_shape, *self.state_mode_sizes)
-        predicted_imag = predicted.imag.view(*leading_shape, *self.state_mode_sizes)
+        predicted_real, predicted_imag = self.prediction_proj(
+            state_real,
+            state_imag,
+            active_sizes=active_sizes,
+            state_rank=self.state_rank,
+            active_rank=resolved_active_rank,
+        )
         if self.use_expressive_mode_couplings:
             coupled_state_real, coupled_state_imag = self._apply_expressive_mode_couplings(
                 state_real,
@@ -1264,6 +2184,65 @@ class _CubeEngineCell(nn.Module):
         predicted_real = _mask_to_active(predicted_real, active_sizes, self.state_rank)
         predicted_imag = _mask_to_active(predicted_imag, active_sizes, self.state_rank)
         return predicted_real, predicted_imag
+
+    def _apply_spectral_reciprocation(
+        self,
+        real: Tensor,
+        imag: Tensor,
+        *,
+        active_sizes: tuple[int, ...],
+        active_rank: Optional[int] = None,
+        normalization_step_sizes: Optional[Tensor] = None,
+        normalization_blend_predictor: Optional[_NormalizationBlendPredictor] = None,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.use_spectral_reciprocation:
+            return real, imag
+
+        resolved_active_rank = self.initial_state_rank if active_rank is None else int(active_rank)
+        state = torch.complex(real, imag)
+        batch_dims = state.ndim - self.state_rank
+        active_slice = (slice(None),) * batch_dims + _active_slice(active_sizes)
+        active_state = state[active_slice]
+        if resolved_active_rank <= 0:
+            return real, imag
+
+        reciprocated = self.spectral_reciprocator(
+            active_state,
+            active_sizes=active_sizes,
+            active_rank=resolved_active_rank,
+            low_frequency_gain=self._spectral_low_frequency_gain_tensor(real),
+            sigma=self._spectral_low_frequency_sigma_tensor(real).clamp_min(1e-6),
+            high_frequency_gain=self._spectral_high_frequency_gain_tensor(real),
+            cutoff=self._spectral_high_frequency_cutoff_tensor(real),
+        )
+
+        state = state.clone()
+        state[active_slice] = reciprocated
+        state = _mask_to_active(state, active_sizes, self.state_rank)
+        spectral_real = state.real
+        spectral_imag = state.imag
+        if normalization_blend_predictor is None:
+            spectral_real, spectral_imag = _normalize_complex_tensor(
+                spectral_real,
+                spectral_imag,
+                self.normalization,
+                state_rank=self.state_rank,
+                active_rank=active_rank,
+                step_sizes=normalization_step_sizes,
+            )
+        else:
+            spectral_real, spectral_imag = _blend_normalized_complex_tensor(
+                spectral_real,
+                spectral_imag,
+                state_rank=self.state_rank,
+                active_sizes=active_sizes,
+                active_rank=active_rank,
+                step_sizes=normalization_step_sizes,
+                blend_predictor=normalization_blend_predictor,
+            )
+        spectral_real = _mask_to_active(spectral_real, active_sizes, self.state_rank)
+        spectral_imag = _mask_to_active(spectral_imag, active_sizes, self.state_rank)
+        return spectral_real, spectral_imag
 
     def _empty_mode_coupling(self, local_real: Tensor, batch_shape: tuple[int, ...], mode_size: int) -> Tensor:
         if self.phase_aware_coupling:
@@ -1679,6 +2658,14 @@ class _CubeEngineCell(nn.Module):
                 step_sizes=normalization_step_sizes,
                 blend_predictor=normalization_blend_predictor,
             )
+        next_real, next_imag = self._apply_spectral_reciprocation(
+            next_real,
+            next_imag,
+            active_sizes=next_active_sizes,
+            active_rank=next_active_rank,
+            normalization_step_sizes=normalization_step_sizes,
+            normalization_blend_predictor=normalization_blend_predictor,
+        )
         next_real = _mask_to_active(next_real, next_active_sizes, self.state_rank)
         next_imag = _mask_to_active(next_imag, next_active_sizes, self.state_rank)
         if allow_growth:
@@ -1745,6 +2732,21 @@ class ReciprocatorMixer(nn.Module):
         learnable_coupling_temperature: bool = False,
         learned_per_mode_scaling: bool = False,
         learned_normalization_blend: bool = False,
+        use_spectral_reciprocation: bool = False,
+        learnable_spectral_reciprocation: bool = False,
+        spectral_mode: str = "wavelet_packet_max_ultimate",
+        joint_spectral_mode: Optional[bool] = None,
+        spectral_low_frequency_gain: float = 0.15,
+        spectral_low_frequency_sigma: float = 0.2,
+        spectral_high_frequency_gain: float = 0.85,
+        spectral_high_frequency_cutoff: float = 0.25,
+        wavelet_name: str = "haar",
+        wavelet_levels: int = 3,
+        wavelet_packet_best_basis: bool = True,
+        wavelet_packet_prune_ratio: float = 1e-3,
+        wavelet_packet_spectral_subtraction: bool = True,
+        wavelet_packet_stationary: bool = True,
+        wavelet_packet_cycle_spins: int = 2,
         adaptive_growth_controls: bool = False,
     ) -> None:
         super().__init__()
@@ -1756,17 +2758,39 @@ class ReciprocatorMixer(nn.Module):
         self.init_mode_sizes = init_mode_sizes
         self.num_cube_engines = num_cube_engines
         self.state_dim = state_dim
+        self.engine_state_feature_dim = 6 + 2 * state_rank
         self.normalization = normalization
         self.accumulator_modulates_gains = accumulator_modulates_gains
         self.dynamic_rank = bool(dynamic_rank)
         self.input_dependent_gains = bool(input_dependent_gains)
         self.selective_gains = bool(selective_gains)
         self.learned_normalization_blend = bool(learned_normalization_blend)
+        self.use_spectral_reciprocation = bool(use_spectral_reciprocation)
+        resolved_joint_spectral_mode = num_cube_engines > 1 if joint_spectral_mode is None else bool(joint_spectral_mode)
+        self.joint_spectral_mode = bool(
+            self.use_spectral_reciprocation and resolved_joint_spectral_mode and num_cube_engines > 1
+        )
+        self.spectral_mode = spectral_mode
         # Optional relaxation: when enabled, share one learned exponent vector
         # across the mixer's per-mode normalization calls.
         self.per_mode_step_sizes = (
             nn.Parameter(torch.ones(state_rank))
             if (normalization == "per_mode" or self.learned_normalization_blend) and learned_per_mode_scaling
+            else None
+        )
+        self.joint_spectral_reciprocator = (
+            SpectralReciprocator(
+                state_rank=1,
+                spectral_mode=spectral_mode,
+                wavelet_name=wavelet_name,
+                wavelet_levels=wavelet_levels,
+                wavelet_packet_best_basis=wavelet_packet_best_basis,
+                wavelet_packet_prune_ratio=wavelet_packet_prune_ratio,
+                wavelet_packet_spectral_subtraction=wavelet_packet_spectral_subtraction,
+                wavelet_packet_stationary=wavelet_packet_stationary,
+                wavelet_packet_cycle_spins=wavelet_packet_cycle_spins,
+            )
+            if self.joint_spectral_mode
             else None
         )
 
@@ -1791,13 +2815,27 @@ class ReciprocatorMixer(nn.Module):
                     phase_aware_coupling=phase_aware_coupling,
                     coupling_temperature=coupling_temperature,
                     learnable_coupling_temperature=learnable_coupling_temperature,
+                    use_spectral_reciprocation=self.use_spectral_reciprocation and not self.joint_spectral_mode,
+                    learnable_spectral_reciprocation=learnable_spectral_reciprocation,
+                    spectral_mode=spectral_mode,
+                    spectral_low_frequency_gain=spectral_low_frequency_gain,
+                    spectral_low_frequency_sigma=spectral_low_frequency_sigma,
+                    spectral_high_frequency_gain=spectral_high_frequency_gain,
+                    spectral_high_frequency_cutoff=spectral_high_frequency_cutoff,
+                    wavelet_name=wavelet_name,
+                    wavelet_levels=wavelet_levels,
+                    wavelet_packet_best_basis=wavelet_packet_best_basis,
+                    wavelet_packet_prune_ratio=wavelet_packet_prune_ratio,
+                    wavelet_packet_spectral_subtraction=wavelet_packet_spectral_subtraction,
+                    wavelet_packet_stationary=wavelet_packet_stationary,
+                    wavelet_packet_cycle_spins=wavelet_packet_cycle_spins,
                     adaptive_growth_controls=adaptive_growth_controls,
                 )
                 for _ in range(num_cube_engines)
             ]
         )
         self.engine_state_to_hidden = nn.ModuleList(
-            [nn.Linear(state_dim * 4, hidden_dim) for _ in range(num_cube_engines)]
+            [nn.Linear(self.engine_state_feature_dim, hidden_dim) for _ in range(num_cube_engines)]
         )
         self.engine_fusion = nn.Linear(hidden_dim * num_cube_engines, hidden_dim)
         self.gain_predictor = (
@@ -1891,6 +2929,33 @@ class ReciprocatorMixer(nn.Module):
             step_sizes=self.per_mode_step_sizes,
         )
 
+    def _maybe_apply_joint_engine_spectral_reciprocation(
+        self,
+        state_reals: list[Tensor],
+        state_imags: list[Tensor],
+        *,
+        active_sizes: tuple[int, ...],
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        if not self.joint_spectral_mode or self.joint_spectral_reciprocator is None:
+            return state_reals, state_imags
+        (
+            low_frequency_gain,
+            sigma,
+            high_frequency_gain,
+            cutoff,
+        ) = _mean_engine_spectral_parameters(self.cube_engines, reference=state_reals[0])
+        return _apply_joint_engine_spectral_reciprocation(
+            self.joint_spectral_reciprocator,
+            state_reals=state_reals,
+            state_imags=state_imags,
+            state_rank=self.state_rank,
+            active_sizes=active_sizes,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+
     def forward(self, x: Tensor) -> Tensor:
         magnitude = F.softplus(self.mag_proj(x))
         phase = torch.tanh(self.phase_proj(x)) * self.phase_scale
@@ -1976,22 +3041,21 @@ class ReciprocatorMixer(nn.Module):
                 state_imags[engine_index] = next_imag
                 state_accumulators[engine_index] = next_accumulator
 
-                state_mag = _mask_to_active(
-                    torch.sqrt(next_real.square() + next_imag.square() + 1e-6),
-                    active_sizes,
-                    self.state_rank,
+            state_reals, state_imags = self._maybe_apply_joint_engine_spectral_reciprocation(
+                state_reals,
+                state_imags,
+                active_sizes=active_sizes,
+            )
+            engine_deltas = []
+            for engine_index in range(self.num_cube_engines):
+                state_features = _engine_state_readout_features(
+                    state_reals[engine_index],
+                    state_imags[engine_index],
+                    state_accumulators[engine_index],
+                    active_sizes=active_sizes,
+                    state_rank=self.state_rank,
+                    active_rank=active_rank,
                 )
-                state_features = torch.cat(
-                    (
-                        next_real.reshape(batch, -1),
-                        next_imag.reshape(batch, -1),
-                        state_mag.reshape(batch, -1),
-                        next_accumulator.reshape(batch, -1),
-                    ),
-                    dim=-1,
-                )
-                # Feed forward the same accumulator that shaped the update so
-                # the hidden-space return map can read out memory strength.
                 engine_deltas.append(self.engine_state_to_hidden[engine_index](state_features))
 
             delta = self.engine_fusion(torch.cat(engine_deltas, dim=-1))
@@ -2036,6 +3100,21 @@ class TransformerBlock(nn.Module):
             learnable_coupling_temperature=config.learnable_coupling_temperature,
             learned_per_mode_scaling=config.learned_per_mode_scaling,
             learned_normalization_blend=config.learned_normalization_blend,
+            use_spectral_reciprocation=config.use_spectral_reciprocation,
+            learnable_spectral_reciprocation=config.learnable_spectral_reciprocation,
+            spectral_mode=config.spectral_mode,
+            joint_spectral_mode=config.joint_spectral_mode,
+            spectral_low_frequency_gain=config.spectral_low_frequency_gain,
+            spectral_low_frequency_sigma=config.spectral_low_frequency_sigma,
+            spectral_high_frequency_gain=config.spectral_high_frequency_gain,
+            spectral_high_frequency_cutoff=config.spectral_high_frequency_cutoff,
+            wavelet_name=config.wavelet_name,
+            wavelet_levels=config.wavelet_levels,
+            wavelet_packet_best_basis=config.wavelet_packet_best_basis,
+            wavelet_packet_prune_ratio=config.wavelet_packet_prune_ratio,
+            wavelet_packet_spectral_subtraction=config.wavelet_packet_spectral_subtraction,
+            wavelet_packet_stationary=config.wavelet_packet_stationary,
+            wavelet_packet_cycle_spins=config.wavelet_packet_cycle_spins,
             adaptive_growth_controls=config.adaptive_growth_controls,
         )
         self.ffn_norm = nn.LayerNorm(config.dim)
@@ -2132,6 +3211,21 @@ class ComplexReciprocatorMixer(nn.Module):
         learnable_coupling_temperature: bool = False,
         learned_per_mode_scaling: bool = False,
         learned_normalization_blend: bool = False,
+        use_spectral_reciprocation: bool = False,
+        learnable_spectral_reciprocation: bool = False,
+        spectral_mode: str = "wavelet_packet_max_ultimate",
+        joint_spectral_mode: Optional[bool] = None,
+        spectral_low_frequency_gain: float = 0.15,
+        spectral_low_frequency_sigma: float = 0.2,
+        spectral_high_frequency_gain: float = 0.85,
+        spectral_high_frequency_cutoff: float = 0.25,
+        wavelet_name: str = "haar",
+        wavelet_levels: int = 3,
+        wavelet_packet_best_basis: bool = True,
+        wavelet_packet_prune_ratio: float = 1e-3,
+        wavelet_packet_spectral_subtraction: bool = True,
+        wavelet_packet_stationary: bool = True,
+        wavelet_packet_cycle_spins: int = 2,
         adaptive_growth_controls: bool = False,
     ) -> None:
         super().__init__()
@@ -2144,6 +3238,7 @@ class ComplexReciprocatorMixer(nn.Module):
         self.normalization = normalization
         self.dropout = dropout
         self.state_dim = state_dim
+        self.engine_state_feature_dim = 6 + 2 * state_rank
         self.persist_state = persist_state
         self.supports_persistent_state = True
         self.dynamic_rank = bool(dynamic_rank)
@@ -2151,9 +3246,30 @@ class ComplexReciprocatorMixer(nn.Module):
         self.selective_gains = bool(selective_gains)
         self.accumulator_modulates_gains = accumulator_modulates_gains
         self.learned_normalization_blend = bool(learned_normalization_blend)
+        self.use_spectral_reciprocation = bool(use_spectral_reciprocation)
+        resolved_joint_spectral_mode = num_cube_engines > 1 if joint_spectral_mode is None else bool(joint_spectral_mode)
+        self.joint_spectral_mode = bool(
+            self.use_spectral_reciprocation and resolved_joint_spectral_mode and num_cube_engines > 1
+        )
+        self.spectral_mode = spectral_mode
         self.per_mode_step_sizes = (
             nn.Parameter(torch.ones(state_rank))
             if (normalization == "per_mode" or self.learned_normalization_blend) and learned_per_mode_scaling
+            else None
+        )
+        self.joint_spectral_reciprocator = (
+            SpectralReciprocator(
+                state_rank=1,
+                spectral_mode=spectral_mode,
+                wavelet_name=wavelet_name,
+                wavelet_levels=wavelet_levels,
+                wavelet_packet_best_basis=wavelet_packet_best_basis,
+                wavelet_packet_prune_ratio=wavelet_packet_prune_ratio,
+                wavelet_packet_spectral_subtraction=wavelet_packet_spectral_subtraction,
+                wavelet_packet_stationary=wavelet_packet_stationary,
+                wavelet_packet_cycle_spins=wavelet_packet_cycle_spins,
+            )
+            if self.joint_spectral_mode
             else None
         )
 
@@ -2177,13 +3293,27 @@ class ComplexReciprocatorMixer(nn.Module):
                     phase_aware_coupling=phase_aware_coupling,
                     coupling_temperature=coupling_temperature,
                     learnable_coupling_temperature=learnable_coupling_temperature,
+                    use_spectral_reciprocation=self.use_spectral_reciprocation and not self.joint_spectral_mode,
+                    learnable_spectral_reciprocation=learnable_spectral_reciprocation,
+                    spectral_mode=spectral_mode,
+                    spectral_low_frequency_gain=spectral_low_frequency_gain,
+                    spectral_low_frequency_sigma=spectral_low_frequency_sigma,
+                    spectral_high_frequency_gain=spectral_high_frequency_gain,
+                    spectral_high_frequency_cutoff=spectral_high_frequency_cutoff,
+                    wavelet_name=wavelet_name,
+                    wavelet_levels=wavelet_levels,
+                    wavelet_packet_best_basis=wavelet_packet_best_basis,
+                    wavelet_packet_prune_ratio=wavelet_packet_prune_ratio,
+                    wavelet_packet_spectral_subtraction=wavelet_packet_spectral_subtraction,
+                    wavelet_packet_stationary=wavelet_packet_stationary,
+                    wavelet_packet_cycle_spins=wavelet_packet_cycle_spins,
                     adaptive_growth_controls=adaptive_growth_controls,
                 )
                 for _ in range(num_cube_engines)
             ]
         )
         self.engine_state_to_hidden = nn.ModuleList(
-            [ComplexLinear(state_dim * 4, hidden_dim) for _ in range(num_cube_engines)]
+            [ComplexLinear(self.engine_state_feature_dim, hidden_dim) for _ in range(num_cube_engines)]
         )
         self.engine_fusion = ComplexLinear(hidden_dim * num_cube_engines, hidden_dim)
         self.gate_proj = nn.Linear(hidden_dim * 4, hidden_dim)
@@ -2323,6 +3453,33 @@ class ComplexReciprocatorMixer(nn.Module):
             step_sizes=self.per_mode_step_sizes,
         )
 
+    def _maybe_apply_joint_engine_spectral_reciprocation(
+        self,
+        state_reals: list[Tensor],
+        state_imags: list[Tensor],
+        *,
+        active_sizes: tuple[int, ...],
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        if not self.joint_spectral_mode or self.joint_spectral_reciprocator is None:
+            return state_reals, state_imags
+        (
+            low_frequency_gain,
+            sigma,
+            high_frequency_gain,
+            cutoff,
+        ) = _mean_engine_spectral_parameters(self.cube_engines, reference=state_reals[0])
+        return _apply_joint_engine_spectral_reciprocation(
+            self.joint_spectral_reciprocator,
+            state_reals=state_reals,
+            state_imags=state_imags,
+            state_rank=self.state_rank,
+            active_sizes=active_sizes,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
+
     def get_extra_state(self) -> dict[str, object]:
         return {
             "persist_state": bool(self.persist_state),
@@ -2453,6 +3610,8 @@ class ComplexReciprocatorMixer(nn.Module):
             "persist_state": self.persist_state,
             "input_dependent_gains": self.input_dependent_gains,
             "selective_gains": self.selective_gains,
+            "joint_spectral_mode": self.joint_spectral_mode,
+            "spectral_mode": self.spectral_mode,
             "accumulator_modulates_gains": self.accumulator_modulates_gains,
             "step_counter": int(self._step_counter.item()),
             "track_persistent_state_gradients": self._track_persistent_state_gradients,
@@ -2562,22 +3721,25 @@ class ComplexReciprocatorMixer(nn.Module):
                 state_imags[engine_index] = next_imag
                 state_accumulators[engine_index] = next_accumulator
 
-                state_mag = _mask_to_active(
-                    torch.sqrt(next_real.square() + next_imag.square() + 1e-6),
-                    active_sizes,
-                    self.state_rank,
+            state_reals, state_imags = self._maybe_apply_joint_engine_spectral_reciprocation(
+                state_reals,
+                state_imags,
+                active_sizes=active_sizes,
+            )
+            engine_deltas = []
+            for engine_index in range(self.num_cube_engines):
+                state_features_real = _engine_state_readout_features(
+                    state_reals[engine_index],
+                    state_imags[engine_index],
+                    state_accumulators[engine_index],
+                    active_sizes=active_sizes,
+                    state_rank=self.state_rank,
+                    active_rank=active_rank,
                 )
-                state_features = torch.cat(
-                    (
-                        next_real.reshape(batch, -1),
-                        next_imag.reshape(batch, -1),
-                        state_mag.reshape(batch, -1),
-                        next_accumulator.reshape(batch, -1),
-                    ),
-                    dim=-1,
+                state_features = torch.complex(
+                    state_features_real,
+                    torch.zeros_like(state_features_real),
                 )
-                # Preserve accumulator visibility in the hidden projection even
-                # though it now actively modulates the recurrent dynamics.
                 engine_deltas.append(self.engine_state_to_hidden[engine_index](state_features))
 
             delta = self.engine_fusion(torch.cat(engine_deltas, dim=-1))
@@ -2646,6 +3808,21 @@ class ParallelComplexReciprocatorMixer(nn.Module):
         learnable_coupling_temperature: bool = False,
         learned_per_mode_scaling: bool = False,
         learned_normalization_blend: bool = False,
+        use_spectral_reciprocation: bool = False,
+        learnable_spectral_reciprocation: bool = False,
+        spectral_mode: str = "wavelet_packet_max_ultimate",
+        joint_spectral_mode: Optional[bool] = None,
+        spectral_low_frequency_gain: float = 0.15,
+        spectral_low_frequency_sigma: float = 0.2,
+        spectral_high_frequency_gain: float = 0.85,
+        spectral_high_frequency_cutoff: float = 0.25,
+        wavelet_name: str = "haar",
+        wavelet_levels: int = 3,
+        wavelet_packet_best_basis: bool = True,
+        wavelet_packet_prune_ratio: float = 1e-3,
+        wavelet_packet_spectral_subtraction: bool = True,
+        wavelet_packet_stationary: bool = True,
+        wavelet_packet_cycle_spins: int = 2,
         adaptive_growth_controls: bool = False,
     ) -> None:
         super().__init__()
@@ -2662,14 +3839,36 @@ class ParallelComplexReciprocatorMixer(nn.Module):
         self.persist_state = False
         self.supports_persistent_state = False
         self.state_dim = state_dim
+        self.engine_state_feature_dim = 6 + 2 * state_rank
         self.dynamic_rank = bool(dynamic_rank)
         self.input_dependent_gains = input_dependent_gains
         self.selective_gains = bool(selective_gains)
         self.accumulator_modulates_gains = accumulator_modulates_gains
         self.learned_normalization_blend = bool(learned_normalization_blend)
+        self.use_spectral_reciprocation = bool(use_spectral_reciprocation)
+        resolved_joint_spectral_mode = num_cube_engines > 1 if joint_spectral_mode is None else bool(joint_spectral_mode)
+        self.joint_spectral_mode = bool(
+            self.use_spectral_reciprocation and resolved_joint_spectral_mode and num_cube_engines > 1
+        )
+        self.spectral_mode = spectral_mode
         self.per_mode_step_sizes = (
             nn.Parameter(torch.ones(state_rank))
             if (normalization == "per_mode" or self.learned_normalization_blend) and learned_per_mode_scaling
+            else None
+        )
+        self.joint_spectral_reciprocator = (
+            SpectralReciprocator(
+                state_rank=1,
+                spectral_mode=spectral_mode,
+                wavelet_name=wavelet_name,
+                wavelet_levels=wavelet_levels,
+                wavelet_packet_best_basis=wavelet_packet_best_basis,
+                wavelet_packet_prune_ratio=wavelet_packet_prune_ratio,
+                wavelet_packet_spectral_subtraction=wavelet_packet_spectral_subtraction,
+                wavelet_packet_stationary=wavelet_packet_stationary,
+                wavelet_packet_cycle_spins=wavelet_packet_cycle_spins,
+            )
+            if self.joint_spectral_mode
             else None
         )
 
@@ -2693,13 +3892,27 @@ class ParallelComplexReciprocatorMixer(nn.Module):
                     phase_aware_coupling=phase_aware_coupling,
                     coupling_temperature=coupling_temperature,
                     learnable_coupling_temperature=learnable_coupling_temperature,
+                    use_spectral_reciprocation=self.use_spectral_reciprocation and not self.joint_spectral_mode,
+                    learnable_spectral_reciprocation=learnable_spectral_reciprocation,
+                    spectral_mode=spectral_mode,
+                    spectral_low_frequency_gain=spectral_low_frequency_gain,
+                    spectral_low_frequency_sigma=spectral_low_frequency_sigma,
+                    spectral_high_frequency_gain=spectral_high_frequency_gain,
+                    spectral_high_frequency_cutoff=spectral_high_frequency_cutoff,
+                    wavelet_name=wavelet_name,
+                    wavelet_levels=wavelet_levels,
+                    wavelet_packet_best_basis=wavelet_packet_best_basis,
+                    wavelet_packet_prune_ratio=wavelet_packet_prune_ratio,
+                    wavelet_packet_spectral_subtraction=wavelet_packet_spectral_subtraction,
+                    wavelet_packet_stationary=wavelet_packet_stationary,
+                    wavelet_packet_cycle_spins=wavelet_packet_cycle_spins,
                     adaptive_growth_controls=adaptive_growth_controls,
                 )
                 for _ in range(num_cube_engines)
             ]
         )
         self.engine_state_to_hidden = nn.ModuleList(
-            [ComplexLinear(state_dim * 4, hidden_dim) for _ in range(num_cube_engines)]
+            [ComplexLinear(self.engine_state_feature_dim, hidden_dim) for _ in range(num_cube_engines)]
         )
         self.engine_fusion = ComplexLinear(hidden_dim * num_cube_engines, hidden_dim)
         self.gate_proj = nn.Linear(hidden_dim * 4, hidden_dim)
@@ -2776,6 +3989,33 @@ class ParallelComplexReciprocatorMixer(nn.Module):
             missing_keys[:] = [key for key in missing_keys if not key.startswith(normalization_prefix)]
         else:
             unexpected_keys[:] = [key for key in unexpected_keys if not key.startswith(normalization_prefix)]
+
+    def _maybe_apply_joint_engine_spectral_reciprocation(
+        self,
+        state_reals: list[Tensor],
+        state_imags: list[Tensor],
+        *,
+        active_sizes: tuple[int, ...],
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        if not self.joint_spectral_mode or self.joint_spectral_reciprocator is None:
+            return state_reals, state_imags
+        (
+            low_frequency_gain,
+            sigma,
+            high_frequency_gain,
+            cutoff,
+        ) = _mean_engine_spectral_parameters(self.cube_engines, reference=state_reals[0])
+        return _apply_joint_engine_spectral_reciprocation(
+            self.joint_spectral_reciprocator,
+            state_reals=state_reals,
+            state_imags=state_imags,
+            state_rank=self.state_rank,
+            active_sizes=active_sizes,
+            low_frequency_gain=low_frequency_gain,
+            sigma=sigma,
+            high_frequency_gain=high_frequency_gain,
+            cutoff=cutoff,
+        )
 
     def _normalize_tensor(
         self,
@@ -2907,19 +4147,24 @@ class ParallelComplexReciprocatorMixer(nn.Module):
                 state_imags[engine_index] = next_imag
                 state_accumulators[engine_index] = next_accumulator
 
-                state_mag = _mask_to_active(
-                    torch.sqrt(next_real.square() + next_imag.square() + 1e-6),
-                    active_sizes,
-                    self.state_rank,
+            state_reals, state_imags = self._maybe_apply_joint_engine_spectral_reciprocation(
+                state_reals,
+                state_imags,
+                active_sizes=active_sizes,
+            )
+            engine_deltas = []
+            for engine_index in range(self.num_cube_engines):
+                state_features_real = _engine_state_readout_features(
+                    state_reals[engine_index],
+                    state_imags[engine_index],
+                    state_accumulators[engine_index],
+                    active_sizes=active_sizes,
+                    state_rank=self.state_rank,
+                    active_rank=active_rank,
                 )
-                state_features = torch.cat(
-                    (
-                        next_real.reshape(batch, -1),
-                        next_imag.reshape(batch, -1),
-                        state_mag.reshape(batch, -1),
-                        next_accumulator.reshape(batch, -1),
-                    ),
-                    dim=-1,
+                state_features = torch.complex(
+                    state_features_real,
+                    torch.zeros_like(state_features_real),
                 )
                 engine_deltas.append(self.engine_state_to_hidden[engine_index](state_features))
 
@@ -3073,6 +4318,14 @@ class ParallelComplexReciprocatorMixer(nn.Module):
                     combined_imag,
                     active_sizes=self.init_mode_sizes,
                     active_rank=active_rank,
+                )
+                norm_real, norm_imag = engine._apply_spectral_reciprocation(
+                    norm_real,
+                    norm_imag,
+                    active_sizes=self.init_mode_sizes,
+                    active_rank=active_rank,
+                    normalization_step_sizes=self.per_mode_step_sizes,
+                    normalization_blend_predictor=self.normalization_blend_predictor,
                 )
                 combined_mag = _mask_to_active(
                     torch.sqrt(combined_real.square() + combined_imag.square() + 1e-6),
@@ -3233,6 +4486,14 @@ class ParallelComplexReciprocatorMixer(nn.Module):
                     active_sizes=self.init_mode_sizes,
                     active_rank=active_rank,
                 )
+                norm_real, norm_imag = engine._apply_spectral_reciprocation(
+                    norm_real,
+                    norm_imag,
+                    active_sizes=self.init_mode_sizes,
+                    active_rank=active_rank,
+                    normalization_step_sizes=self.per_mode_step_sizes,
+                    normalization_blend_predictor=self.normalization_blend_predictor,
+                )
                 combined_mag = _mask_to_active(
                     torch.sqrt(combined_real.square() + combined_imag.square() + 1e-6),
                     self.init_mode_sizes,
@@ -3255,26 +4516,27 @@ class ParallelComplexReciprocatorMixer(nn.Module):
             all_states_imag.append(norm_imag)
             all_state_accumulators.append(accumulator)
 
+        all_states_real, all_states_imag = self._maybe_apply_joint_engine_spectral_reciprocation(
+            all_states_real,
+            all_states_imag,
+            active_sizes=self.init_mode_sizes,
+        )
+
         # Extract features from all engines (vectorized across timesteps)
         engine_deltas = []
         for engine_index in range(self.num_cube_engines):
             sr = all_states_real[engine_index]
             si = all_states_imag[engine_index]
             se = all_state_accumulators[engine_index]
-            sm = _mask_to_active(
-                torch.sqrt(sr.square() + si.square() + 1e-6),
-                self.init_mode_sizes,
-                self.state_rank,
+            features_real = _engine_state_readout_features(
+                sr,
+                si,
+                se,
+                active_sizes=self.init_mode_sizes,
+                state_rank=self.state_rank,
+                active_rank=active_rank,
             )
-            features = torch.cat(
-                (
-                    sr.reshape(batch, steps, -1),
-                    si.reshape(batch, steps, -1),
-                    sm.reshape(batch, steps, -1),
-                    se.reshape(batch, steps, -1),
-                ),
-                dim=-1,
-            )
+            features = torch.complex(features_real, torch.zeros_like(features_real))
             # Keep the accumulator in the readout features even though it now
             # also causally modulates gains and coupling earlier in the engine.
             engine_deltas.append(self.engine_state_to_hidden[engine_index](features))
@@ -3323,6 +4585,21 @@ class ReciprocatorOnlyBlock(nn.Module):
             learnable_coupling_temperature=config.learnable_coupling_temperature,
             learned_per_mode_scaling=config.learned_per_mode_scaling,
             learned_normalization_blend=config.learned_normalization_blend,
+            use_spectral_reciprocation=config.use_spectral_reciprocation,
+            learnable_spectral_reciprocation=config.learnable_spectral_reciprocation,
+            spectral_mode=config.spectral_mode,
+            joint_spectral_mode=config.joint_spectral_mode,
+            spectral_low_frequency_gain=config.spectral_low_frequency_gain,
+            spectral_low_frequency_sigma=config.spectral_low_frequency_sigma,
+            spectral_high_frequency_gain=config.spectral_high_frequency_gain,
+            spectral_high_frequency_cutoff=config.spectral_high_frequency_cutoff,
+            wavelet_name=config.wavelet_name,
+            wavelet_levels=config.wavelet_levels,
+            wavelet_packet_best_basis=config.wavelet_packet_best_basis,
+            wavelet_packet_prune_ratio=config.wavelet_packet_prune_ratio,
+            wavelet_packet_spectral_subtraction=config.wavelet_packet_spectral_subtraction,
+            wavelet_packet_stationary=config.wavelet_packet_stationary,
+            wavelet_packet_cycle_spins=config.wavelet_packet_cycle_spins,
             adaptive_growth_controls=config.adaptive_growth_controls,
         )
         self.ffn_norm = ComplexLayerNorm(config.dim)

@@ -42,6 +42,9 @@ DEFAULT_BEST_CHECKPOINT = ROOT / "runs" / "reciprocator_only_best.pt"
 DEFAULT_STATE_CAPACITY = 64
 DEFAULT_FRESH_TRAINING_MODE = "streaming"
 DEFAULT_FRESH_STREAM_RESET_POLICY = "wrap"
+DEFAULT_FRESH_LR_SCHEDULE = "cosine"
+DEFAULT_FRESH_WARMUP_FRACTION = 0.02
+DEFAULT_FRESH_MIN_LR_RATIO = 0.1
 
 
 def _parse_size_tuple(value: str) -> tuple[int, ...]:
@@ -67,18 +70,30 @@ def _resolve_mode_sizes(
     state_capacity: Optional[int],
 ) -> tuple[Optional[tuple[int, ...]], tuple[int, ...]]:
     resolved_max_state_rank = state_rank if max_state_rank is None else max_state_rank
+    normalized_max_mode_sizes = max_mode_sizes
+    if normalized_max_mode_sizes is not None:
+        if len(normalized_max_mode_sizes) == state_rank and resolved_max_state_rank > state_rank:
+            normalized_max_mode_sizes = normalized_max_mode_sizes + (2,) * (resolved_max_state_rank - state_rank)
+        elif len(normalized_max_mode_sizes) != resolved_max_state_rank:
+            raise ValueError("max_mode_sizes length must match state_rank or max_state_rank")
+        normalized_max_mode_sizes = tuple(int(size) for size in normalized_max_mode_sizes)
+        if any(size <= 0 for size in normalized_max_mode_sizes):
+            raise ValueError("max_mode_sizes must contain positive integers")
     effective_state_capacity = (
         DEFAULT_STATE_CAPACITY
-        if max_mode_sizes is None and state_capacity is None
+        if normalized_max_mode_sizes is None and state_capacity is None
         else state_capacity
     )
-    _, resolved_max_mode_sizes = select_mode_size_pair(
-        state_rank=resolved_max_state_rank,
-        init_mode_sizes=None,
-        max_mode_sizes=max_mode_sizes,
-        init_capacity=None,
-        max_capacity=effective_state_capacity,
-    )
+    if normalized_max_mode_sizes is None:
+        _, resolved_max_mode_sizes = select_mode_size_pair(
+            state_rank=resolved_max_state_rank,
+            init_mode_sizes=None,
+            max_mode_sizes=None,
+            init_capacity=None,
+            max_capacity=effective_state_capacity,
+        )
+    else:
+        resolved_max_mode_sizes = normalized_max_mode_sizes
 
     if init_mode_sizes is not None:
         if len(init_mode_sizes) == resolved_max_state_rank:
@@ -95,9 +110,9 @@ def _resolve_mode_sizes(
             resolved_init_mode_sizes, resolved_max_mode_sizes = select_mode_size_pair(
                 state_rank=state_rank,
                 init_mode_sizes=None,
-                max_mode_sizes=max_mode_sizes if max_mode_sizes is not None else None,
+                max_mode_sizes=normalized_max_mode_sizes if normalized_max_mode_sizes is not None else None,
                 init_capacity=init_state_capacity,
-                max_capacity=effective_state_capacity if max_mode_sizes is None else None,
+                max_capacity=effective_state_capacity if normalized_max_mode_sizes is None else None,
             )
             return resolved_init_mode_sizes, resolved_max_mode_sizes
         resolved_init_mode_sizes, _ = select_mode_size_pair(
@@ -550,20 +565,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train ReciprocatorOnlyLM on bundled corpora.")
     add_device_argument(parser, default="auto")
     parser.add_argument("--steps", type=int, default=5000, help="Total optimization steps to run.")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=64)
-    parser.add_argument("--dim", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--layers", type=int, default=4)
-    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--vocab-size", type=int, default=512)
-    parser.add_argument("--state-rank", type=int, default=3)
+    parser.add_argument("--state-rank", type=int, default=4)
     parser.add_argument(
         "--max-state-rank",
         type=int,
-        default=None,
-        help="Maximum supported tensor rank. Defaults to --state-rank for backward-compatible fixed-rank runs.",
+        default=8,
+        help="Maximum supported tensor rank. Fresh runs default to 8; set it equal to --state-rank for fixed-rank runs.",
     )
     parser.add_argument(
         "--dynamic-rank",
@@ -574,19 +589,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--init-mode-sizes",
         type=_parse_size_tuple,
-        default=None,
+        default=(4, 4, 2, 2),
         help=(
             "Optional comma-separated init mode sizes. "
-            "If omitted, derived from --init-state-capacity under the requested rank."
+            "Fresh runs default to 4,4,2,2 and pad trailing singleton modes when --max-state-rank exceeds --state-rank."
         ),
     )
     parser.add_argument(
         "--max-mode-sizes",
         type=_parse_size_tuple,
-        default=None,
+        default=(8, 8, 4, 4),
         help=(
             "Optional comma-separated max mode sizes. "
-            "If omitted, derived from --state-capacity under the requested rank."
+            "Fresh runs default to 8,8,4,4 and pad trailing size-2 modes when --max-state-rank exceeds --state-rank."
         ),
     )
     parser.add_argument(
@@ -612,8 +627,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--normalization",
         choices=("frobenius", "per_mode"),
-        default="per_mode",
-        help="Reciprocator state normalization. Defaults to per-mode normalization.",
+        default="frobenius",
+        help="Reciprocator state normalization. Defaults to Frobenius normalization.",
     )
     parser.add_argument(
         "--learned-per-mode-scaling",
@@ -658,24 +673,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the parallel Reciprocator mixer. Only supported for non-streaming training.",
     )
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(
         "--lr-schedule",
         choices=("constant", "cosine"),
         default=None,
-        help="Learning-rate schedule. Fresh runs default to constant; resumes default to the saved value.",
+        help="Learning-rate schedule. Fresh runs default to cosine; resumes default to the saved value.",
     )
     parser.add_argument(
         "--warmup-fraction",
         type=float,
         default=None,
-        help="Warmup fraction for cosine LR. Fresh runs default to 0.0; resumes default to the saved value.",
+        help="Warmup fraction for cosine LR. Fresh runs default to 0.02; resumes default to the saved value.",
     )
     parser.add_argument(
         "--min-lr-ratio",
         type=float,
         default=None,
-        help="Final LR / base LR for cosine decay. Fresh runs default to 0.0; resumes default to the saved value.",
+        help="Final LR / base LR for cosine decay. Fresh runs default to 0.1; resumes default to the saved value.",
     )
     parser.add_argument(
         "--grad-clip",
@@ -989,15 +1004,15 @@ def main() -> None:
     tbptt_horizon = int(loaded_tbptt_horizon or 0) if args.tbptt_horizon is None else int(args.tbptt_horizon)
     if training_mode != "streaming" and tbptt_horizon != 0:
         raise ValueError("--tbptt-horizon is only supported with --training-mode streaming")
-    lr_schedule = args.lr_schedule or loaded_lr_schedule or "constant"
+    lr_schedule = args.lr_schedule or loaded_lr_schedule or DEFAULT_FRESH_LR_SCHEDULE
     if lr_schedule not in {"constant", "cosine"}:
         raise ValueError(f"Unsupported learning-rate schedule: {lr_schedule}")
     warmup_fraction = loaded_warmup_fraction if args.warmup_fraction is None else args.warmup_fraction
     if warmup_fraction is None:
-        warmup_fraction = 0.0
+        warmup_fraction = DEFAULT_FRESH_WARMUP_FRACTION
     min_lr_ratio = loaded_min_lr_ratio if args.min_lr_ratio is None else args.min_lr_ratio
     if min_lr_ratio is None:
-        min_lr_ratio = 0.0
+        min_lr_ratio = DEFAULT_FRESH_MIN_LR_RATIO
     grad_clip = loaded_grad_clip if args.grad_clip is None else args.grad_clip
     if grad_clip is None:
         grad_clip = 0.0

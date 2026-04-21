@@ -22,26 +22,29 @@ pytest
 
 Experiment outputs and checkpoints are written under `runs/`, which is intentionally ignored by Git.
 
-## Current Training Run
+## Default Run
 
-To resume the current `full_corpus_dynamic_rank_streaming_r1to6_alllearn` run from its latest checkpoint, run this from the repository root inside your active Python environment:
+To run the current default training command from the repository root inside your active Python environment, use:
 
 ```bash
-python -u scripts/train_reciprocator_only.py \
-  --device cpu \
+python3 scripts/train_reciprocator_only.py \
+  --device auto \
   --steps 5000 \
-  --batch-size 8 \
-  --resume runs/full_corpus_dynamic_rank_streaming_r1to6_alllearn/latest.pt \
-  --training-mode streaming \
-  --stream-reset-policy wrap \
-  --log-every 100 \
-  --save-every 100 \
-  --eval-every 100 \
-  --eval-batches 8 \
-  --benchmark-examples 128 \
-  --benchmark-every 200 \
-  --latest-checkpoint runs/full_corpus_dynamic_rank_streaming_r1to6_alllearn/latest.pt \
-  --best-checkpoint runs/full_corpus_dynamic_rank_streaming_r1to6_alllearn/best.pt \
+  --batch-size 2 \
+  --seq-len 256 \
+  --dim 256 \
+  --layers 4 \
+  --heads 8 \
+  --vocab-size 512 \
+  --state-rank 4 \
+  --max-state-rank 8 \
+  --init-mode-sizes 4,4,2,2 \
+  --max-mode-sizes 8,8,4,4 \
+  --num-cube-engines 4 \
+  --dropout 0.05 \
+  --lr-schedule cosine \
+  --warmup-fraction 0.02 \
+  --min-lr-ratio 0.1 \
   --skip-online-demo
 ```
 
@@ -55,12 +58,12 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 | --- | --- | --- |
 | `--device {cpu,cuda,mps,auto}` | `auto` | Execution device. `auto` prefers CUDA, then MPS, then CPU. |
 | `--steps` | `5000` | Total optimizer steps. |
-| `--batch-size` | `8` | Batch size for random mode, or chunks-per-step in streaming mode. |
-| `--seq-len` | `64` | Sequence length. |
+| `--batch-size` | `2` | Batch size for random mode, or chunks-per-step in streaming mode. |
+| `--seq-len` | `256` | Sequence length. |
 | `--lr` | `3e-4` | Base learning rate. |
-| `--lr-schedule {constant,cosine}` | fresh run: `constant`; resume: checkpoint value | Learning-rate schedule. |
-| `--warmup-fraction` | fresh run: `0.0`; resume: checkpoint value | Warmup fraction used with cosine LR. |
-| `--min-lr-ratio` | fresh run: `0.0`; resume: checkpoint value | Final LR divided by base LR for cosine decay. |
+| `--lr-schedule {constant,cosine}` | fresh run: `cosine`; resume: checkpoint value | Learning-rate schedule. |
+| `--warmup-fraction` | fresh run: `0.02`; resume: checkpoint value | Warmup fraction used with cosine LR. |
+| `--min-lr-ratio` | fresh run: `0.1`; resume: checkpoint value | Final LR divided by base LR for cosine decay. |
 | `--grad-clip` | fresh run: `0.0`; resume: checkpoint value | Gradient clipping threshold. |
 | `--lr-step-offset` | fresh run: `0`; resume: checkpoint value | LR schedule origin shift for resumed taper phases. |
 | `--log-every` | `100` | Print training metrics every N steps. |
@@ -73,11 +76,11 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--dim` | `128` | Model width. |
+| `--dim` | `256` | Model width. |
 | `--layers` | `4` | Number of layers. |
-| `--heads` | `4` | Number of attention-style heads used by the model config. |
+| `--heads` | `8` | Number of attention-style heads used by the model config. |
 | `--mlp-ratio` | `4.0` | Feed-forward expansion ratio. |
-| `--dropout` | `0.0` | Dropout probability. |
+| `--dropout` | `0.05` | Dropout probability. |
 | `--vocab-size` | `512` | SentencePiece vocabulary size for fresh tokenizer training. |
 | `--num-cube-engines` | `4` | Number of Reciprocator engines per layer. |
 
@@ -85,11 +88,11 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--state-rank` | `3` | Active tensor rank. |
-| `--max-state-rank` | `--state-rank` | Maximum supported rank for dynamic growth. |
+| `--state-rank` | `4` | Active tensor rank. |
+| `--max-state-rank` | `8` | Maximum supported rank for dynamic growth. |
 | `--dynamic-rank` / `--no-dynamic-rank` | `true` | Enable novelty-driven rank growth. |
-| `--init-mode-sizes` | derived | Explicit comma-separated initial mode sizes. |
-| `--max-mode-sizes` | derived | Explicit comma-separated maximum mode sizes. |
+| `--init-mode-sizes` | `4,4,2,2` | Explicit comma-separated initial mode sizes; padded with trailing singleton modes when `--max-state-rank` exceeds `--state-rank`. |
+| `--max-mode-sizes` | `8,8,4,4` | Explicit comma-separated maximum mode sizes; padded with trailing size-2 modes when `--max-state-rank` exceeds `--state-rank`. |
 | `--init-state-capacity` | matches `--state-capacity` if omitted | Initial active state capacity used to derive init mode sizes. |
 | `--state-capacity` | `64` if omitted | Maximum state capacity used to derive max mode sizes. |
 | `--growth-threshold` | `0.02` | Novelty threshold for growth events. |
@@ -99,7 +102,7 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--normalization {frobenius,per_mode}` | `per_mode` | State normalization family. |
+| `--normalization {frobenius,per_mode}` | `frobenius` | State normalization family. |
 | `--learned-per-mode-scaling` / `--no-learned-per-mode-scaling` | `true` | Learn per-mode normalization exponents. |
 | `--learnable-prediction-eta` / `--no-learnable-prediction-eta` | `true` | Learn anticipation gain `eta`. |
 | `--learnable-coupling-temperature` / `--no-learnable-coupling-temperature` | `true` | Learn phase-aware coupling temperature. |
