@@ -40,6 +40,8 @@ DEFAULT_TOKENIZER_PREFIX = ROOT / "scripts" / "reciprocator_only_tokenizer"
 DEFAULT_LATEST_CHECKPOINT = ROOT / "runs" / "reciprocator_only_latest.pt"
 DEFAULT_BEST_CHECKPOINT = ROOT / "runs" / "reciprocator_only_best.pt"
 DEFAULT_STATE_CAPACITY = 64
+DEFAULT_FRESH_TRAINING_MODE = "streaming"
+DEFAULT_FRESH_STREAM_RESET_POLICY = "wrap"
 
 
 def _parse_size_tuple(value: str) -> tuple[int, ...]:
@@ -547,8 +549,8 @@ def _derive_checkpoint_paths(
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train ReciprocatorOnlyLM on bundled corpora.")
     add_device_argument(parser, default="auto")
-    parser.add_argument("--steps", type=int, default=1000, help="Total optimization steps to run.")
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--steps", type=int, default=5000, help="Total optimization steps to run.")
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
@@ -565,8 +567,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dynamic-rank",
-        action="store_true",
-        help="Enable novelty-driven rank growth up to --max-state-rank during training or online mode.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable novelty-driven rank growth up to --max-state-rank during training or online mode. Defaults to enabled.",
     )
     parser.add_argument(
         "--init-mode-sizes",
@@ -614,23 +617,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--learned-per-mode-scaling",
-        action="store_true",
-        help="Relax per-mode normalization with learned per-mode exponents. Only applies with --normalization=per_mode.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Relax per-mode normalization with learned per-mode exponents. "
+            "Only applies with --normalization=per_mode. Defaults to enabled."
+        ),
     )
     parser.add_argument(
         "--learnable-prediction-eta",
-        action="store_true",
-        help="Learn the anticipation gain eta instead of keeping it fixed at --prediction-eta.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Learn the anticipation gain eta instead of keeping it fixed at --prediction-eta. Defaults to enabled.",
     )
     parser.add_argument(
         "--learnable-coupling-temperature",
-        action="store_true",
-        help="Learn the phase-aware coupling temperature instead of keeping it fixed.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Learn the phase-aware coupling temperature instead of keeping it fixed. Defaults to enabled.",
     )
     parser.add_argument(
         "--learned-normalization-blend",
-        action="store_true",
-        help="Learn a blend between normalization families instead of using a fixed normalization path.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Learn a blend between normalization families instead of using a fixed normalization path. Defaults to enabled.",
     )
     parser.add_argument(
         "--all-learnable-mixer-params",
@@ -683,20 +693,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "measured relative to the resumed segment instead of the original run."
         ),
     )
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--eval-every", type=int, default=100)
-    parser.add_argument("--eval-batches", type=int, default=16)
+    parser.add_argument("--eval-batches", type=int, default=8)
     parser.add_argument(
         "--benchmark-examples",
         type=int,
-        default=0,
+        default=128,
         help="Run periodic synthetic benchmark-suite probes with this many examples per task. Disabled when 0.",
     )
     parser.add_argument(
         "--benchmark-every",
         type=int,
-        default=0,
+        default=200,
         help="Probe the synthetic benchmark suite every N steps. Defaults to --eval-every when probes are enabled.",
     )
     parser.add_argument(
@@ -769,11 +779,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Path for best training checkpoint, selected by validation loss when available.",
     )
     parser.add_argument(
-        "--skip-online-demo",
-        action="store_true",
-        help="Skip the online adaptation demo after training finishes.",
-    )
-    parser.add_argument(
         "--checkpoint-out",
         type=Path,
         default=None,
@@ -784,7 +789,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=("random", "streaming"),
         default=None,
         help=(
-            "Fresh runs default to random-window training. "
+            "Fresh runs default to streaming training. "
             "Streaming mode uses contiguous chunks with online reciprocator state inside "
             "each optimizer step and treats --batch-size as chunks-per-step."
         ),
@@ -794,7 +799,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=("wrap", "never"),
         default=None,
         help=(
-            "Streaming mode only. 'wrap' resets persistent reciprocator state when the "
+            "Streaming mode only. Fresh runs default to 'wrap', which resets persistent reciprocator state when the "
             "training stream wraps to the corpus start; 'never' keeps state across wraps. "
             "Document boundaries are not tracked separately."
         ),
@@ -808,6 +813,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "detaching persistent reciprocator state. Fresh runs default to disabled (0); "
             "resumes default to the checkpoint's saved value."
         ),
+    )
+    online_demo_group = parser.add_mutually_exclusive_group()
+    online_demo_group.add_argument(
+        "--skip-online-demo",
+        dest="skip_online_demo",
+        action="store_true",
+        default=True,
+        help="Skip the online adaptation demo after training finishes. Defaults to enabled.",
+    )
+    online_demo_group.add_argument(
+        "--run-online-demo",
+        dest="skip_online_demo",
+        action="store_false",
+        help="Run the online adaptation demo after training finishes.",
     )
     return parser
 
@@ -961,10 +980,10 @@ def main() -> None:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
         val_fraction = 0.05 if args.val_fraction is None else args.val_fraction
 
-    training_mode = args.training_mode or loaded_training_mode or "random"
+    training_mode = args.training_mode or loaded_training_mode or DEFAULT_FRESH_TRAINING_MODE
     if training_mode not in {"random", "streaming"}:
         raise ValueError(f"Unsupported training mode: {training_mode}")
-    stream_reset_policy = args.stream_reset_policy or loaded_stream_reset_policy or "wrap"
+    stream_reset_policy = args.stream_reset_policy or loaded_stream_reset_policy or DEFAULT_FRESH_STREAM_RESET_POLICY
     if stream_reset_policy not in {"wrap", "never"}:
         raise ValueError(f"Unsupported stream reset policy: {stream_reset_policy}")
     tbptt_horizon = int(loaded_tbptt_horizon or 0) if args.tbptt_horizon is None else int(args.tbptt_horizon)

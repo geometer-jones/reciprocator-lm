@@ -86,17 +86,66 @@ def test_train_reciprocator_only_defaults_to_per_mode_normalization() -> None:
 
     args = train_script._build_arg_parser().parse_args([])
 
-    assert args.normalization == "per_mode"
-    assert args.learned_per_mode_scaling is False
-
-
-def test_train_reciprocator_only_parses_learned_per_mode_scaling_flag() -> None:
-    train_script = _load_script_module("train_reciprocator_only.py")
-
-    args = train_script._build_arg_parser().parse_args(["--normalization", "per_mode", "--learned-per-mode-scaling"])
-
+    assert args.dynamic_rank is True
     assert args.normalization == "per_mode"
     assert args.learned_per_mode_scaling is True
+    assert args.learnable_prediction_eta is True
+    assert args.learnable_coupling_temperature is True
+    assert args.learned_normalization_blend is True
+    assert args.steps == 5000
+    assert args.batch_size == 8
+    assert args.log_every == 100
+    assert args.save_every == 100
+    assert args.eval_every == 100
+    assert args.eval_batches == 8
+    assert args.benchmark_examples == 128
+    assert args.benchmark_every == 200
+    assert args.skip_online_demo is True
+
+
+def test_train_reciprocator_only_fresh_run_defaults_to_streaming_runtime_mode() -> None:
+    train_script = _load_script_module("train_reciprocator_only.py")
+
+    args = train_script._build_arg_parser().parse_args([])
+
+    training_mode = args.training_mode or None or train_script.DEFAULT_FRESH_TRAINING_MODE
+    stream_reset_policy = args.stream_reset_policy or None or train_script.DEFAULT_FRESH_STREAM_RESET_POLICY
+
+    assert args.training_mode is None
+    assert args.stream_reset_policy is None
+    assert training_mode == "streaming"
+    assert stream_reset_policy == "wrap"
+
+
+def test_train_reciprocator_only_can_opt_back_into_online_demo() -> None:
+    train_script = _load_script_module("train_reciprocator_only.py")
+
+    args = train_script._build_arg_parser().parse_args(["--run-online-demo"])
+
+    assert args.skip_online_demo is False
+
+
+def test_train_reciprocator_only_can_disable_optional_growth_and_mixer_flags() -> None:
+    train_script = _load_script_module("train_reciprocator_only.py")
+
+    args = train_script._build_arg_parser().parse_args(
+        [
+            "--no-dynamic-rank",
+            "--normalization",
+            "per_mode",
+            "--no-learned-per-mode-scaling",
+            "--no-learnable-prediction-eta",
+            "--no-learnable-coupling-temperature",
+            "--no-learned-normalization-blend",
+        ]
+    )
+
+    assert args.normalization == "per_mode"
+    assert args.dynamic_rank is False
+    assert args.learned_per_mode_scaling is False
+    assert args.learnable_prediction_eta is False
+    assert args.learnable_coupling_temperature is False
+    assert args.learned_normalization_blend is False
 
 
 def test_train_reciprocator_only_all_learnable_mixer_params_enables_optional_controls() -> None:
