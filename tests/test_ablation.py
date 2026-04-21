@@ -120,6 +120,21 @@ def test_train_reciprocator_only_defaults_to_frobenius_normalization() -> None:
     assert args.init_mode_sizes == (4, 4, 2, 2)
     assert args.max_mode_sizes == (8, 8, 4, 4)
     assert args.dropout == pytest.approx(0.05)
+    assert args.use_spectral_reciprocation is True
+    assert args.learnable_spectral_reciprocation is True
+    assert args.spectral_mode == "wavelet_packet_max_ultimate"
+    assert args.joint_spectral_mode is None
+    assert args.spectral_low_frequency_gain == pytest.approx(0.15)
+    assert args.spectral_low_frequency_sigma == pytest.approx(0.2)
+    assert args.spectral_high_frequency_gain == pytest.approx(0.85)
+    assert args.spectral_high_frequency_cutoff == pytest.approx(0.25)
+    assert args.wavelet_name == "haar"
+    assert args.wavelet_levels == 3
+    assert args.wavelet_packet_best_basis is True
+    assert args.wavelet_packet_prune_ratio == pytest.approx(1e-3)
+    assert args.wavelet_packet_spectral_subtraction is True
+    assert args.wavelet_packet_stationary is True
+    assert args.wavelet_packet_cycle_spins == 2
     assert args.log_every == 100
     assert args.save_every == 100
     assert args.eval_every == 100
@@ -183,6 +198,55 @@ def test_train_reciprocator_only_can_disable_optional_growth_and_mixer_flags() -
     assert args.learnable_prediction_eta is False
     assert args.learnable_coupling_temperature is False
     assert args.learned_normalization_blend is False
+
+
+def test_train_reciprocator_only_can_override_spectral_flags() -> None:
+    train_script = _load_script_module("train_reciprocator_only.py")
+
+    args = train_script._build_arg_parser().parse_args(
+        [
+            "--no-use-spectral-reciprocation",
+            "--no-learnable-spectral-reciprocation",
+            "--spectral-mode",
+            "fft",
+            "--joint-spectral-mode",
+            "--spectral-low-frequency-gain",
+            "0.3",
+            "--spectral-low-frequency-sigma",
+            "0.4",
+            "--spectral-high-frequency-gain",
+            "0.7",
+            "--spectral-high-frequency-cutoff",
+            "0.2",
+            "--wavelet-name",
+            "db1",
+            "--wavelet-levels",
+            "4",
+            "--no-wavelet-packet-best-basis",
+            "--wavelet-packet-prune-ratio",
+            "0.02",
+            "--no-wavelet-packet-spectral-subtraction",
+            "--no-wavelet-packet-stationary",
+            "--wavelet-packet-cycle-spins",
+            "3",
+        ]
+    )
+
+    assert args.use_spectral_reciprocation is False
+    assert args.learnable_spectral_reciprocation is False
+    assert args.spectral_mode == "fft"
+    assert args.joint_spectral_mode is True
+    assert args.spectral_low_frequency_gain == pytest.approx(0.3)
+    assert args.spectral_low_frequency_sigma == pytest.approx(0.4)
+    assert args.spectral_high_frequency_gain == pytest.approx(0.7)
+    assert args.spectral_high_frequency_cutoff == pytest.approx(0.2)
+    assert args.wavelet_name == "db1"
+    assert args.wavelet_levels == 4
+    assert args.wavelet_packet_best_basis is False
+    assert args.wavelet_packet_prune_ratio == pytest.approx(0.02)
+    assert args.wavelet_packet_spectral_subtraction is False
+    assert args.wavelet_packet_stationary is False
+    assert args.wavelet_packet_cycle_spins == 3
 
 
 def test_train_reciprocator_only_all_learnable_mixer_params_enables_optional_controls() -> None:

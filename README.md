@@ -42,6 +42,21 @@ python3 scripts/train_reciprocator_only.py \
   --max-mode-sizes 8,8,4,4 \
   --num-cube-engines 4 \
   --dropout 0.05 \
+  --use-spectral-reciprocation \
+  --learnable-spectral-reciprocation \
+  --spectral-mode wavelet_packet_max_ultimate \
+  --joint-spectral-mode \
+  --spectral-low-frequency-gain 0.15 \
+  --spectral-low-frequency-sigma 0.2 \
+  --spectral-high-frequency-gain 0.85 \
+  --spectral-high-frequency-cutoff 0.25 \
+  --wavelet-name haar \
+  --wavelet-levels 3 \
+  --wavelet-packet-best-basis \
+  --wavelet-packet-prune-ratio 1e-3 \
+  --wavelet-packet-spectral-subtraction \
+  --wavelet-packet-stationary \
+  --wavelet-packet-cycle-spins 2 \
   --lr-schedule cosine \
   --warmup-fraction 0.02 \
   --min-lr-ratio 0.1 \
@@ -109,6 +124,26 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 | `--learned-normalization-blend` / `--no-learned-normalization-blend` | `true` | Learn the blend between normalization families. |
 | `--all-learnable-mixer-params` | `false` | Force all optional learnable mixer controls on. |
 | `--parallel-mixer` | `false` | Use the parallel Reciprocator mixer. Not supported with streaming/persistent state. |
+
+### Spectral Reciprocation
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--use-spectral-reciprocation` / `--no-use-spectral-reciprocation` | `true` | Enable the spectral reciprocation block. |
+| `--learnable-spectral-reciprocation` / `--no-learnable-spectral-reciprocation` | `true` | Learn the spectral filter parameters. |
+| `--spectral-mode {wavelet_packet_max_ultimate,wavelet_packet_max_gauge,wavelet_packet,dwt,fft}` | `wavelet_packet_max_ultimate` | Spectral reciprocation backend. |
+| `--joint-spectral-mode` / `--no-joint-spectral-mode` | `auto` | Apply spectral reciprocation jointly across cube engines. Auto enables it when spectral reciprocation is on and `--num-cube-engines > 1`. |
+| `--spectral-low-frequency-gain` | `0.15` | Low-frequency spectral boost gain. |
+| `--spectral-low-frequency-sigma` | `0.2` | Low-frequency spectral boost bandwidth. |
+| `--spectral-high-frequency-gain` | `0.85` | Residual gain above the high-frequency cutoff. |
+| `--spectral-high-frequency-cutoff` | `0.25` | High-frequency damping cutoff. |
+| `--wavelet-name {haar,db1}` | `haar` | Wavelet family for wavelet-based spectral modes. |
+| `--wavelet-levels` | `3` | Wavelet decomposition depth for wavelet-based spectral modes. |
+| `--wavelet-packet-best-basis` / `--no-wavelet-packet-best-basis` | `true` | Enable best-basis selection inside wavelet packet modes. |
+| `--wavelet-packet-prune-ratio` | `1e-3` | Energy/coherence pruning threshold for wavelet packet leaves. |
+| `--wavelet-packet-spectral-subtraction` / `--no-wavelet-packet-spectral-subtraction` | `true` | Enable wavelet packet spectral subtraction. |
+| `--wavelet-packet-stationary` / `--no-wavelet-packet-stationary` | `true` | Average over cycle-spun stationary wavelet packet passes. |
+| `--wavelet-packet-cycle-spins` | `2` | Number of cycle-spun stationary passes for wavelet packet modes. |
 
 ### Streaming and Persistent State
 

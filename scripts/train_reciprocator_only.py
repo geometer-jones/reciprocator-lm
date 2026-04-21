@@ -675,6 +675,99 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(
+        "--use-spectral-reciprocation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the spectral reciprocation block. Defaults to enabled.",
+    )
+    parser.add_argument(
+        "--learnable-spectral-reciprocation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Learn the spectral reciprocation filter parameters. Defaults to enabled.",
+    )
+    parser.add_argument(
+        "--spectral-mode",
+        choices=("wavelet_packet_max_ultimate", "wavelet_packet_max_gauge", "wavelet_packet", "dwt", "fft"),
+        default="wavelet_packet_max_ultimate",
+        help="Spectral reciprocation backend. Defaults to wavelet_packet_max_ultimate.",
+    )
+    parser.add_argument(
+        "--joint-spectral-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether spectral reciprocation is applied jointly across cube engines. "
+            "Defaults to auto: enabled when spectral reciprocation is on and --num-cube-engines > 1."
+        ),
+    )
+    parser.add_argument(
+        "--spectral-low-frequency-gain",
+        type=float,
+        default=0.15,
+        help="Low-frequency spectral boost gain.",
+    )
+    parser.add_argument(
+        "--spectral-low-frequency-sigma",
+        type=float,
+        default=0.2,
+        help="Low-frequency spectral boost bandwidth.",
+    )
+    parser.add_argument(
+        "--spectral-high-frequency-gain",
+        type=float,
+        default=0.85,
+        help="Residual gain applied above the high-frequency cutoff.",
+    )
+    parser.add_argument(
+        "--spectral-high-frequency-cutoff",
+        type=float,
+        default=0.25,
+        help="High-frequency damping cutoff.",
+    )
+    parser.add_argument(
+        "--wavelet-name",
+        choices=("haar", "db1"),
+        default="haar",
+        help="Wavelet family used by wavelet-based spectral reciprocation modes.",
+    )
+    parser.add_argument(
+        "--wavelet-levels",
+        type=int,
+        default=3,
+        help="Wavelet decomposition depth for wavelet-based spectral reciprocation modes.",
+    )
+    parser.add_argument(
+        "--wavelet-packet-best-basis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable best-basis selection inside wavelet packet spectral reciprocation. Defaults to enabled.",
+    )
+    parser.add_argument(
+        "--wavelet-packet-prune-ratio",
+        type=float,
+        default=1e-3,
+        help="Energy/coherence pruning threshold for wavelet packet leaves.",
+    )
+    parser.add_argument(
+        "--wavelet-packet-spectral-subtraction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable wavelet packet spectral subtraction. Defaults to enabled.",
+    )
+    parser.add_argument(
+        "--wavelet-packet-stationary",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Average over cycle-spun stationary wavelet packet passes. Defaults to enabled.",
+    )
+    parser.add_argument(
+        "--wavelet-packet-cycle-spins",
+        type=int,
+        default=2,
+        help="Number of cycle-spun stationary passes for wavelet packet modes.",
+    )
+    parser.add_argument(
         "--lr-schedule",
         choices=("constant", "cosine"),
         default=None,
@@ -981,6 +1074,21 @@ def main() -> None:
             learnable_coupling_temperature=args.learnable_coupling_temperature,
             learned_normalization_blend=args.learned_normalization_blend,
             dropout=args.dropout,
+            use_spectral_reciprocation=args.use_spectral_reciprocation,
+            learnable_spectral_reciprocation=args.learnable_spectral_reciprocation,
+            spectral_mode=args.spectral_mode,
+            joint_spectral_mode=args.joint_spectral_mode,
+            spectral_low_frequency_gain=args.spectral_low_frequency_gain,
+            spectral_low_frequency_sigma=args.spectral_low_frequency_sigma,
+            spectral_high_frequency_gain=args.spectral_high_frequency_gain,
+            spectral_high_frequency_cutoff=args.spectral_high_frequency_cutoff,
+            wavelet_name=args.wavelet_name,
+            wavelet_levels=args.wavelet_levels,
+            wavelet_packet_best_basis=args.wavelet_packet_best_basis,
+            wavelet_packet_prune_ratio=args.wavelet_packet_prune_ratio,
+            wavelet_packet_spectral_subtraction=args.wavelet_packet_spectral_subtraction,
+            wavelet_packet_stationary=args.wavelet_packet_stationary,
+            wavelet_packet_cycle_spins=args.wavelet_packet_cycle_spins,
             growth_threshold=args.growth_threshold,
             growth_interval=args.growth_interval,
             persist_state=args.training_mode == "streaming",
