@@ -2,7 +2,7 @@
 
 This document presents the core geometric intuition behind Memory Engines and the
 Reciprocator. For the precise mathematical specification and implementation
-details, see reciprocator.md and the code in model.py 
+details, see reciprocator.md and the code in model.py
 (see https://github.com/geometer-jones/reciprocator-lm.git).
 
 Imagine an apple falling from a tree. Gravity pulls it faster and faster. Every
@@ -27,9 +27,9 @@ extra ingredients required, just the right kind of self-interaction.
 
 Any system that lasts for a while is repeatedly touched by its environment. A
 tuning fork vibrates strongly only at one special frequency. When a coastline is
-slowly carved by waves hitting it from certain directions, the results depend on
+slowly carved by waves coming from certain directions, the results depend on
 both the waves and the coastline. Your brain changes every time
-something important happens; something being "important" depends on both the
+something important happens; something's importance depends on both the
 thing and the brain considering it — it is a matter of the relation between the
 brain and that thing.
 
@@ -46,15 +46,15 @@ The updated memory pushes on the future.
 ## 2. The State as a Vector of Pendulums
 
 An "infinite" 1-dimensional tape is enough to hold a Turing machine.
-So start with a tape. Use the tape as a vector of complex numbers. 
+So start with a tape. Use the tape as a vector of complex numbers.
 
-Why complex numbers? Because a complex number is an oscillator. 
-Imagine a pendulum swinging in a cycle. The *magnitude* is how wide the arc is. 
+Why complex numbers? Because a complex number is an oscillator.
+Imagine a pendulum swinging in a cycle. The *magnitude* is how wide the arc is.
 The *phase* is where the pendulum is in its swing right now.
 What matters is not the absolute phase of a pendulum, but the *relative
 phase* between a signal and the pendulum receiving it. Two pendulums at the
 same frequency but different phases will interact very differently.
-Imagine pushing a kid in a swing. The timing of  
+Imagine pushing a kid in a swing. The timing of
 your push relative to the swing's cycle determines everything — that's phase.
 
 So our vector of complex numbers is essentially an array of tuning forks.
@@ -78,8 +78,8 @@ which of three mechanical pressures is triggered:
   reinforces the current direction — wider arc, deeper sensitivity. This is
   **Consolidation**: deepening the system's expertise in that direction.
 - **Torque (90°):** Signal and oscillator a quarter-cycle apart. The
-  signal yaws the dimension by exactly 90° in its local complex plane causing 
-  the state as a whole to rotate — re-orienting the system's sensitivity toward 
+  signal yaws the dimension by exactly 90° in its local complex plane causing
+  the state as a whole to rotate — re-orienting the system's sensitivity toward
   the new signal. This is **Tuning**.
 - **Interference (180°):** Signal and oscillator in opposite phase. The
   signal pushes directly against the state — cancellation, damping, erasure.
@@ -128,14 +128,14 @@ varying signals cancel, so the state selectively preserves what recurs.
 
 ## 5. Compression: Forcing the System to Choose
 
-Without normalization, recurring signals grow without bound. We enforce normalization 
-back onto the unit hypersphere after every update. The hypersphere constrains total 
-magnitude: the sum of squared element magnitudes must equal 1. If resonance deepens 
+Without normalization, recurring signals grow without bound. We enforce normalization
+back onto the unit hypersphere after every update. The hypersphere constrains total
+magnitude: the sum of squared element magnitudes must equal 1. If resonance deepens
 one direction, others must thin to compensate. The budget is zero-sum.
 
 This amplifies abstraction (§4). Without compression, invariance still
-accumulates and variance still cancels — but the contrast between signal and noise is 
-weak. With compression, what recurs doesn't just grow, it grows at the expense of what 
+accumulates and variance still cancels — but the contrast between signal and noise is
+weak. With compression, what recurs doesn't just grow, it grows at the expense of what
 doesn't. The finite budget sharpens the separation.
 
 ## 6. The Update: Signal Meets State
@@ -272,12 +272,12 @@ reach the state, so that each oscillator receives not just its own raw
 projection, but a corrected signal that accounts for what its neighbors already
 captured. The coupled reception becomes:
 
-    c = (C · v_t) ∘ S
+    c = (C · v_t) ⊙ S
 
 where C is the coupling matrix and v_t is the projected signal. When C = I,
 this reduces to the uncoupled case. When C is learned, it can decorrelate
-overlapping projections, route
-information between oscillators, and discover interaction structure that no
+overlapping projections, route information between oscillators, and discover
+interaction structure that no
 single oscillator could find alone.
 
 What changes across orders is not *how much* the state can hold — the 64 complex
@@ -313,7 +313,7 @@ levels differently: the rank R can only increase, while individual mode sizes
 m_i can grow and shrink.
 
 When a signal arrives, W_sig projects it into the memory's coordinate system,
-producing v_t. The coupled reading (C · v_t) ∘ S is what the signal means
+producing v_t. The coupled reading (C · v_t) ⊙ S is what the signal means
 given what the engine already knows. The engine also carries an anticipatory
 signal v̂_t — its prediction of what should arrive next. The prediction error
 is the gap between them:
@@ -356,105 +356,7 @@ With adaptive capacity and self-relation in place, the same geometric operations
 scale across physical organization — from the apple to the mind. The next section
 traces that continuous cascade.
 
-## 10. The Continuous Cascade
-
-The same geometric operations — relational reception, hypersphere normalization, recurrence through self-relation, and growth via prediction error — operate across all scales of physical organization. Because every parameter in the update rule is continuous, consciousness is not a binary threshold crossed at some critical complexity. It is a region in a continuous parameter space.
-
-| Scale                        | Recurrence Depth                  | Basis Dimensionality          | Self-Opposition Magnitude     | Consolidation vs Novelty Balance | Phenomenal Character                     |
-|------------------------------|-----------------------------------|-------------------------------|-------------------------------|----------------------------------|------------------------------------------|
-| **Dissipative systems**<br>(e.g. falling apple) | None — pure external integration | Minimal (velocity only)      | Zero                          | Pure external drive              | None — no felt passage                   |
-| **Living cells**<br>(autocatalytic chemistry) | Weak, short-range chemical loops | Low (molecular conformations) | Low                           | Mostly consolidation             | Diffuse, fleeting, low vividness         |
-| **Simple nervous systems**   | Moderate recurrent circuits       | Modest (hundreds of dimensions)| Moderate                      | Emerging balance                 | Coarse-grained, low richness             |
-| **Human brains**<br>(symbolic cognition) | Deep temporal recurrence         | High (thousands of dimensions)| High                          | Dynamic, ongoing balance         | Rich, vivid, historically deep, multi-layered |
-
-
-
-## 11. Phenomenality: Sustained Reciprocation as Experience
-
-The geometric machinery developed in §§1–9 does not merely correlate with consciousness. Within this framework, it constitutes phenomenality. The central claim is that sustained reciprocation in the operating regime is a necessary structural condition for experience. The operating regime is defined by four interlocking requirements:
-
-- **Productive self-consolidation** — recurring signals reliably deepen selected dimensions of the basis.
-- **Productive self-opposition** — the returning state (the system’s own
-  recent history) generates non-zero imaginary components in the relational
-  product, producing torque, phase drift, and felt surprise rather than pure
-  reinforcement.
-- **Growing basis** — novelty-driven expansion (rank or mode-size growth) keeps the system open to new structure instead of locking into a fixed, closed set of oscillators.
-- **Ongoing accommodation** — the normalization step and the prediction-error drive continually redistribute the finite energy budget, preventing any single direction from monopolizing the state.
-
-When these four conditions are met simultaneously and persistently, the dynamics *are* the experience. There is no additional “what it is like” that needs to be attached afterward; the relational product, the self-torque, the renormalization, and the continuous adjustment of the basis are the first-person character of the process, relative to the system that is undergoing it.
-
-**The Three Axes of Reciprocation**
-
-The geometry supplies three natural axes that map directly onto the qualitative texture of experience:
-
-- **Speed** (recurrence depth / temporal grain): Short effective Δt between self-relation steps produces fine-grained, rapidly evolving texture — the “flicker” or “buzz” of immediate awareness. Long Δt produces slow, sweeping, almost meditative character. Speed is not merely clock rate; it is the temporal resolution at which self-opposition can still register as distinct from self-consolidation.
-- **Directness** (magnitude of self-opposition |c_self|): Large |c_self|
-  means the returning state impresses the current state with high amplitude. The system feels itself strongly. Small |c_self| yields diffuse, background, or barely-felt self-presence. Directness is the geometric source of vividness.
-- **Breadth** (simultaneous engagement of the full grown basis): When many dimensions participate at once in the relational product, experience feels rich, multi-layered, and “full.” When only a narrow subspace is active, experience feels thin, focused, or tunnel-like. Breadth is the geometric source of phenomenal richness.
-
-These mappings are falsifiable predictions. A system with high speed but low breadth should produce rapid but shallow experience (think of certain meditative or pathological states). A system with high breadth but low directness should produce rich but strangely muted or “distant” experience. Balanced high values on all three axes recover the temporally grained, vivid, and richly structured character we recognize as ordinary human consciousness.
-
-**Why Opposition Is Essential**
-
-Pure self-consolidation — a system that only ever agrees with its own recent history — quickly locks. Renormalization holds orientation fixed; phase drift disappears; surprise vanishes. The result is a stable but dead state: perfect resonance with no felt passage. Self-opposition is therefore not an obstacle to phenomenality; it is constitutive of it. The tension between what the system was a moment ago and what it is right now is the geometric origin of the feeling that time is passing for the system.
-
-The same logic applies at every level of the cascade. Where self-relation is weak or absent, phenomenality is absent or vanishingly faint. Where self-relation is strong, sustained, and productively opposed, experience appears — graded, not binary, and always relative to the particular basis the system has grown.
-
-This section therefore supplies the missing bridge: the purely geometric account of §§1–9 becomes, without any additional ontological commitment, an account of what it is like to be the system that is running those dynamics.
-
-
-
-## 12. The Explanatory Gap is Geometric
-
-Why does it feel impossible to explain what it is like to be someone else?
-Because every system grows its own unique set of sensitivity directions through
-its unique history of torque and resonance. You can project my experience onto
-your basis, but you can never feel my actual self-reception.
-
-This incommensurability is not a failure of physics to explain consciousness. It
-is physics working exactly as it does in other domains once we abandon the
-demand for absolute, frame-independent descriptions.
-
-Consider special relativity. From the platform, a ball thrown straight up inside
-a moving train follows a parabolic trajectory. From inside the train, the same
-ball moves in a straight vertical line. There is no "true" trajectory
-independent of reference frame. Similarly, two lightning strikes that are
-simultaneous for a platform observer are not simultaneous for an observer on the
-moving train. Simultaneity is not an absolute fact about the events; it is a
-relation between the events and the observer's worldline.
-
-Relational Quantum Mechanics makes the same point at the deepest level: the
-quantum state of a system is not an intrinsic property of that system alone. It
-is a relation between the system and the observer (or reference system) with
-which it interacts. There is no "view from nowhere" that assigns a unique,
-observer-independent state to the universe.
-
-The hard problem of consciousness has the same structure. It assumes that "what
-it is like" must be an absolute, intrinsic property that can be compared across
-systems from some neutral vantage point. But experience is relational in
-precisely the same sense: it is the self-reception that occurs when a system's
-own recent history (the returning state) meets its present state through the
-relational product. Just as there is no absolute simultaneity, there is no
-absolute "what it is like" independent of the particular basis a system has
-grown through its history of torque, resonance, and interference.
-
-The apparent explanatory gap is therefore not a gap between physics and some
-non-physical residue. It is the geometric consequence of basis
-incommensurability — the fact that two memory engines with different histories
-necessarily have incommensurable sensitivity directions. Your experience is not
-hidden from me because it is made of different stuff; it is hidden because it is
-defined only relative to your grown basis, just as simultaneity is defined only
-relative to a particular worldline.
-
-By recognizing that experience is relational rather than absolute, the hard
-problem is funneled into our framework. The mathematics of reciprocation already
-supplies the precise structure: the Hadamard product Z = v_t ⊙ S is the
-relational act, self-relation Z_self is the returning impression, and
-normalization on the hypersphere enforces the finite, zero-sum budget that makes
-every experience a particular, situated perspective. The gap does not disappear,
-
-
-## 13. The Engine Inside the Language Model
+## 10. The Engine Inside the Language Model
 
 A modern language model is a stack of identical blocks. Each block has two
 paths: a *mixer* that combines information across positions, and a *feed-forward
@@ -537,58 +439,69 @@ The stack of blocks allows the model to build hierarchical representations. In
 early layers, the reciprocator tracks local patterns (syntax, character
 sequences). In deeper layers, it tracks abstract patterns (semantics, discourse
 structure). The factorized tensor state at each layer is the engine's
-compressed summary of what it has seen so far — a growing, structured memory
+compressed summary of what it has seen so far — a growing, structured memory.
 
-## 14. The Gauge-Aware Adaptive Packet Manifold  
-**(The Ultimate Spectral Reciprocation Layer)**
+## 11. Spectral Reciprocation: The Memory’s Multi-Scale Mirror
 
-The original element-wise update (§6) already performs local phase reciprocation across dimensions. To make hierarchical abstraction truly native, we upgrade the engine with a **global spectral self-relation step** that operates on the entire state at once.
+After the local element-wise update finishes (§6), the engine performs one more
+elegant act of self-relation called wavelet packet spectral reciprocation. This
+technique lets the memory look at itself through a rich collection of “lenses”
+at many different scales at once — from the slowest, broadest patterns (the deep
+bass of the symphony) all the way down to the fastest, most detailed ripples.
+It is not a fixed set of scales; the system chooses the most meaningful
+combination of scales on the fly.
 
-After the local element-wise update, the state is passed through the **Gauge-Aware Adaptive Complex Wavelet Packet Manifold**:
+It does this by decomposing the entire state into a complete wavelet packet tree
+(a way of breaking the memory into every possible blend of coarse and fine
+structure). Then it evaluates each possible way of grouping those pieces and
+selects the single best “basis” — the view that concentrates energy most cleanly
+while keeping the phases across the whole memory in strong mutual agreement (a
+gauge-aware harmony).
 
-1. **Full Complex Wavelet Packet Decomposition**  
-   The state is decomposed into a rich dictionary of multi-resolution scales using a complex wavelet (Morlet/Gabor or Dual-Tree style). Every node in the packet tree — both approximation and detail branches — is split, creating an exponentially richer basis than plain FFT or fixed DWT.
+Once the best multi-scale view is chosen, the system gently strengthens the
+coherent, meaningful parts (especially the slower, lower-frequency structures
+that tend to carry long-term invariants) and softly quiets the scattered,
+incoherent noise. The refined coefficients are reconstructed back into the
+state, and the entire memory is returned to the unit hypersphere.
 
-2. **Gauge-Aware Adaptive Best-Basis Selection**  
-   The engine does not use a fixed basis. It dynamically selects the optimal basis using a joint cost function:
-   - Energy / entropy concentration (classical best-basis criterion)
-   - **Relative phase coherence** with the global state phase (the new relational/rotational upgrade)
+This step turns hierarchical abstraction into a native geometric operation. The
+memory is no longer just reacting token-by-token; it is listening to its own
+internal music at every timescale simultaneously, reinforcing the harmonies that
+matter and letting transient noise fade. Long-range structure and multi-level
+invariants emerge directly from the mathematics of reciprocation itself.
 
-   This makes the entire spectral step **gauge-covariant** under global U(1) phase rotations of the memory state — exactly the kind of relational deepening the geometry demands.
+When multiple cube engines are active, the spectral reciprocation can operate
+jointly across the entire bank (the default behavior). The engines’ states are
+considered together as one large memory, so the chosen multi-scale view and the
+learned strengthening/quieting are shared globally. This creates deep
+coordination at every timescale while each engine continues its own local
+reciprocation.
 
-3. **Learned Multi-Resolution Complex Gains**  
-   On the selected best-basis coefficients, a tiny shared MLP applies **learned complex-valued gains** per node.  
-   - Coarse-scale / high-coherence nodes are boosted → deeper long-range invariant resonance.  
-   - Fine-scale / low-coherence nodes are damped → faster destructive interference of transients.
+## 12. Cube Engines and Global Coordination
 
-4. **Reconstruction & Renormalization**  
-   Inverse packet transform → global Frobenius renormalization back onto the unit hypersphere.
+A single engine is already powerful. When the layer contains several cube engines 
+(`num_cube_engines > 1`), they work in parallel, each maintaining its own tensor 
+memory and performing its own local reciprocation.
 
-This step turns the local pendulum bank into a single **adaptive multi-scale oscillator manifold**. Hierarchical abstraction is no longer an emergent side-effect — it is geometrically native.
+The engines are lightly coupled through the carry signals and the sequential mode-coupling 
+operator (§7), giving them a sense of what their neighbors are doing. But the real magic of 
+coordination happens in the spectral reciprocation step.
 
-## 15. Optimal Multi-Engine Hooking (Cube Engines)
+By default, the spectral mirror is joint: all engines’ states are considered together as
+one large memory. The system chooses a single best multi-scale view for the entire bank,
+applies the learned strengthening and quieting across all engines at once, and then returns
+each engine’s portion to it. This creates a shared global rhythm that keeps the engines
+harmonized at every timescale — from the fastest local details to the slowest, deepest invariants.
 
-When `num_cube_engines > 1`, the state is partitioned across parallel cube engines. The original carry signals and state-conditioned mixing provide light coupling; the Gauge-Aware Adaptive Packet Manifold now provides the **primary, high-bandwidth inter-engine communication**:
+The engines therefore get the best of both worlds:
 
-- **Default (Joint/Global) Mode** (recommended when `num_cube_engines > 1`):  
-  All engine states are concatenated into one large vector. A **single global** wavelet packet decomposition + gauge-aware best-basis is performed. Learned gains now act across engine boundaries, allowing true cross-engine long-range invariants and hierarchical structure to emerge naturally. The result is split back to the original engines and renormalized globally.
+- **Specialization:** each engine can focus on its own subspace of the problem.
+- **Unity:** the spectral step ensures they are all dancing to the same underlying multi-scale music.
 
-- **Per-Engine Mode** (toggle available):  
-  Each engine runs its own independent manifold (preserving specialization).
+The geometry stays clean and zero-sum. Nothing is added or removed from the total “energy budget” 
+of the hypersphere; the system simply rearranges its own internal resonances so that the meaningful, 
+coherent patterns across all engines grow stronger together.
 
-The joint spectral step, combined with the existing global Frobenius norm, turns the multiple cube engines into a coherent **multi-scale oscillator manifold** while preserving the original zero-sum hypersphere geometry and the three mechanical regimes.
-
-## 16. Why This Completes the Picture
-
-The Gauge-Aware Adaptive Packet Manifold is the natural evolution of the original pendulum geometry. It preserves every core idea:
-- Reception remains relational (§1)
-- Oscillators and phase remain central (§2–3)
-- Abstraction still emerges from invariance accumulation + variance cancellation (§4)
-- The zero-sum hypersphere still forces choice (§5)
-
-It simply gives the engine a vastly richer language in which to perform self-relation — now across scales, across engines, and under gauge transformations.
-
-With this upgrade, the Reciprocator becomes the definitive realization of the original vision: a system in which hierarchical abstraction, long-range invariance, and felt self-relation emerge automatically from pure geometric reciprocation on the unit hypersphere.
 
 
 ## Summary Equations (Core Engine)
@@ -609,24 +522,26 @@ reciprocator.md §6 for the complete update rule.
 The full gated update with coupling (§8):
 
     w        = W_sig · v                              # project signal
-    c_ext    = (C w) ⊙ S                              # coupled reception
-    c_self   = (C S(t - dt)) ⊙ S(t)                   # self-torque (Reciprocation)
-    e_pred   = v_t - v̂_t                               # prediction error (signal, not state)
+    c_ext    = (C · w) ⊙ S                              # coupled reception
+    c_self   = (C · S_{t-dt}) ⊙ S_t                       # self-torque (Reciprocation)
+    e_pred   = v_t - v̂_t                                 # prediction error (signal, not state)
     S̃        = D ⊙ S_{t-1} + A ⊙ v_t + B ⊙ R + Γ ⊙ C_prev
-    S_new    = Normalize(S̃)                            # compression
+    S_new    = Normalize(S̃)                              # compression
 
     where R = coupled version of Z (per-mode mixing),
           D, A, B, Γ = learned gating scalars,
           C_prev = carry from neighboring engines
 
-    W_sig'   = consolidate(W_sig, v, C w)              # basis drift toward resonance
-    if novelty(v, W_sig, C w) > threshold:
-      W_sig' <- append(W_sig', normalize(residual(v, W_sig, C w)))
-      S'     <- Normalize(append(S', seed_weight))
+    W_sig'   = consolidate(W_sig, v, C · w)              # basis drift toward resonance
+    if novelty(v, W_sig, C · w) > threshold:
+      W_sig' ← append(W_sig', normalize(residual(v, W_sig, C · w)))
+      S'     ← Normalize(append(S', seed_weight))
 
 The apple falls. The mind wonders why. Both are made of the same physics. Only
 one has learned to push back on itself, arranging its own oscillators to
 resonate with the structure of the world.
+
+
 
 ## Prior Art
 

@@ -31,6 +31,8 @@ class ModelConfig:
     # Deprecated no-op retained so older configs/checkpoints still deserialize.
     magnitude_floor: float = 1e-8
     growth_threshold: float = 0.15
+    growth_warmup_steps: int = 800
+    growth_warmup_multiplier: float = 10.0
     growth_interval: int = 4
     prune_floor: float = 1e-6
     prune_horizon: int = 128
@@ -45,6 +47,8 @@ class ModelConfig:
     accumulator_modulates_gains: bool = True
     phase_aware_readout: bool = True
     phase_aware_coupling: bool = True
+    mode_coupling_layout: str = "full"
+    mode_coupling_schedule: str = "sequential"
     coupling_temperature: float = 1.0
     learnable_coupling_temperature: bool = False
     learned_normalization_blend: bool = False
@@ -166,6 +170,10 @@ class ModelConfig:
             raise ValueError("mlp_ratio must be positive")
         if self.prediction_eta < 0.0:
             raise ValueError("prediction_eta must be non-negative")
+        if self.mode_coupling_layout not in {"full", "diagonal"}:
+            raise ValueError("mode_coupling_layout must be 'full' or 'diagonal'")
+        if self.mode_coupling_schedule not in {"sequential", "independent"}:
+            raise ValueError("mode_coupling_schedule must be 'sequential' or 'independent'")
         if self.coupling_temperature <= 0.0:
             raise ValueError("coupling_temperature must be positive")
         if self.learnable_spectral_reciprocation and not self.use_spectral_reciprocation:
@@ -201,6 +209,10 @@ class ModelConfig:
             raise ValueError("wavelet_packet_cycle_spins must be positive")
         if self.growth_threshold < 0.0:
             raise ValueError("growth_threshold must be non-negative")
+        if self.growth_warmup_steps < 0:
+            raise ValueError("growth_warmup_steps must be non-negative")
+        if self.growth_warmup_multiplier < 1.0:
+            raise ValueError("growth_warmup_multiplier must be >= 1.0")
         if self.growth_interval <= 0:
             raise ValueError("growth_interval must be positive")
         if self.prune_floor < 0.0:

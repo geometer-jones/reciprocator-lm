@@ -63,7 +63,7 @@ from .experiments import (
     train_benchmark_task,
     train_causal_language_model,
 )
-from .model import ModifiedTransformerLM, ReciprocatorOnlyLM
+from .model import ReciprocatorOnlyLM
 from .probes import mode_axis_permutation_probe
 from .scan import (
     EncodedScanExample,
@@ -120,7 +120,6 @@ __all__ = [
     "BundledCorpus",
     "ModReLU",
     "ModelConfig",
-    "ModifiedTransformerLM",
     "PlainTransformerLM",
     "SmallMambaConfig",
     "SmallMambaLM",

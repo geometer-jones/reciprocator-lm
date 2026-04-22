@@ -4,7 +4,7 @@
 
 The repository includes:
 
-- `src/reciprocator_lm/`: core model code, baselines, benchmark utilities, corpora helpers, tokenization, SCAN tasks, and sleep/replay training logic
+- `src/reciprocator_lm/`: core package code, including the split model stack (`model_state.py`, `model_spectral.py`, `model_predictors.py`, `model_engine.py`, `model_complex_backbone.py`) plus the compatibility re-export surface in `model.py`
 - `scripts/`: experiment and training entry-point scripts
 - `tests/`: `pytest` coverage for the main package modules
 - `corpora/`: bundled text corpora plus source metadata
@@ -41,6 +41,9 @@ python3 scripts/train_reciprocator_only.py \
   --init-mode-sizes 4,4,2,2 \
   --max-mode-sizes 8,8,4,4 \
   --num-cube-engines 4 \
+  --growth-threshold 0.02 \
+  --growth-warmup-steps 800 \
+  --growth-warmup-multiplier 10.0 \
   --dropout 0.05 \
   --use-spectral-reciprocation \
   --learnable-spectral-reciprocation \
@@ -110,7 +113,9 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 | `--max-mode-sizes` | `8,8,4,4` | Explicit comma-separated maximum mode sizes; padded with trailing size-2 modes when `--max-state-rank` exceeds `--state-rank`. |
 | `--init-state-capacity` | matches `--state-capacity` if omitted | Initial active state capacity used to derive init mode sizes. |
 | `--state-capacity` | `64` if omitted | Maximum state capacity used to derive max mode sizes. |
-| `--growth-threshold` | `0.02` | Novelty threshold for growth events. |
+| `--growth-threshold` | `0.02` | Nominal novelty threshold for growth events after warmup. |
+| `--growth-warmup-steps` | `800` | Number of initial steps that keep growth suppressed while the engine stabilizes. |
+| `--growth-warmup-multiplier` | `10.0` | Multiplier applied to `--growth-threshold` during the warmup window. |
 | `--growth-interval` | `1` | Check growth every N steps. |
 
 ### Normalization and Learnable Mixer Controls
@@ -183,3 +188,14 @@ Defaults below are for fresh runs unless noted otherwise. For resume-aware flags
 | `--checkpoint-out` | unset | Optional exported model checkpoint with embedded tokenizer. |
 | `--skip-online-demo` | `true` | Skip the post-training online adaptation demo. |
 | `--run-online-demo` | `false` | Re-enable the post-training online adaptation demo. |
+
+## `prime_reciprocator_state.py` Growth Flags
+
+Fresh priming builds accept the same growth warmup controls as the main training script and persist them into the emitted checkpoint config:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--growth-threshold` | `0.02` | Nominal novelty threshold stored in fresh priming checkpoints. |
+| `--growth-warmup-steps` | `800` | Warmup window stored in fresh priming checkpoints for later training or resumed online use. |
+| `--growth-warmup-multiplier` | `10.0` | Warmup suppression multiplier stored in fresh priming checkpoints. |
+| `--growth-interval` | `1` | Growth check cadence stored in fresh priming checkpoints. |

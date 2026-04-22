@@ -5,13 +5,15 @@ from typing import Optional
 import pytest
 import torch
 
-from reciprocator_lm import ModelConfig, ModifiedTransformerLM, ReciprocatorOnlyLM, apply_complex_rope, complex_rope_frequencies
-from reciprocator_lm.experiments import _annealed_growth_threshold, _reset_optimizer_moments
-from reciprocator_lm.model import (
+from reciprocator_lm import ModelConfig, ReciprocatorOnlyLM, apply_complex_rope, complex_rope_frequencies
+from reciprocator_lm.experiments import _effective_growth_threshold, _reset_optimizer_moments
+from reciprocator_lm.model_complex_backbone import (
     ComplexReciprocatorMixer,
     ParallelComplexReciprocatorMixer,
     ReciprocatorOnlyBlock,
-    _CubeEngineCell,
+)
+from reciprocator_lm.model_engine import _CubeEngineCell
+from reciprocator_lm.model_state import (
     _apply_mode_couplings,
     _apply_mode_couplings_pair,
     _mask_to_active,
@@ -21,22 +23,6 @@ from reciprocator_lm.model import (
     _relational_product,
     _relational_gain_statistics,
 )
-
-
-def make_model() -> ModifiedTransformerLM:
-    config = ModelConfig(
-        vocab_size=32,
-        max_seq_len=16,
-        dim=32,
-        n_layers=2,
-        n_heads=4,
-        state_rank=3,
-        state_mode_sizes=(3, 3, 3),
-        num_cube_engines=3,
-        normalization="per_mode",
-        dropout=0.0,
-    )
-    return ModifiedTransformerLM(config)
 
 
 def _assert_prediction_projector_has_grad(projector: torch.nn.Module) -> None:
@@ -65,6 +51,8 @@ def test_config_derives_rank3_state_shape() -> None:
     assert config.selective_gains is False
     assert config.learnable_coupling_temperature is False
     assert config.learned_normalization_blend is False
+    assert config.mode_coupling_layout == "full"
+    assert config.mode_coupling_schedule == "sequential"
     assert config.use_spectral_reciprocation is True
     assert config.learnable_spectral_reciprocation is True
     assert config.spectral_mode == "wavelet_packet_max_ultimate"
@@ -74,6 +62,8 @@ def test_config_derives_rank3_state_shape() -> None:
     assert config.wavelet_packet_best_basis is True
     assert config.wavelet_packet_stationary is True
     assert config.adaptive_growth_controls is False
+    assert config.growth_warmup_steps == 800
+    assert config.growth_warmup_multiplier == pytest.approx(10.0)
 
 
 def test_config_derives_asymmetric_mode_sizes_from_state_dim() -> None:
@@ -120,6 +110,14 @@ def test_config_pads_init_mode_sizes_for_dynamic_rank_growth() -> None:
     assert config.max_mode_sizes == (2, 3, 4)
     assert config.state_mode_sizes == (2, 3, 4)
     assert config.state_dim == 24
+
+
+def test_config_rejects_invalid_mode_coupling_controls() -> None:
+    with pytest.raises(ValueError, match="mode_coupling_layout"):
+        ModelConfig(vocab_size=32, mode_coupling_layout="banded")
+
+    with pytest.raises(ValueError, match="mode_coupling_schedule"):
+        ModelConfig(vocab_size=32, mode_coupling_schedule="alternating")
 
 
 def test_config_pads_rank8_max_mode_sizes_from_initial_rank_shorthand() -> None:
@@ -200,6 +198,14 @@ def test_model_config_defaults_ffn_on_difference_when_loading_legacy_payload() -
     assert restored.ffn_on_difference is True
 
 
+def test_config_rejects_invalid_growth_warmup_controls() -> None:
+    with pytest.raises(ValueError, match="growth_warmup_steps"):
+        ModelConfig(vocab_size=32, growth_warmup_steps=-1)
+
+    with pytest.raises(ValueError, match="growth_warmup_multiplier"):
+        ModelConfig(vocab_size=32, growth_warmup_multiplier=0.5)
+
+
 @pytest.mark.parametrize(
     ("ffn_on_difference", "expected_source"),
     [
@@ -269,53 +275,6 @@ def test_reciprocator_block_routes_ffn_input_from_config(
     torch.testing.assert_close(output, expected_hidden)
     torch.testing.assert_close(capture_norm.last_input, expected_ffn_source)
 
-
-def test_forward_shapes_and_loss() -> None:
-    torch.manual_seed(0)
-    model = make_model()
-    inputs = torch.randint(0, 32, (2, 8))
-    targets = torch.randint(0, 32, (2, 8))
-
-    logits, loss = model(inputs, targets)
-
-    assert logits.shape == (2, 8, 32)
-    assert loss is not None
-    assert loss.ndim == 0
-
-
-def test_backward_pass_produces_gradients() -> None:
-    torch.manual_seed(0)
-    model = make_model()
-    inputs = torch.randint(0, 32, (2, 8))
-    targets = torch.randint(0, 32, (2, 8))
-
-    _, loss = model(inputs, targets)
-    assert loss is not None
-    loss.backward()
-
-    assert model.token_embedding.weight.grad is not None
-    assert model.blocks[0].mixer.engine_state_to_hidden[0].weight.grad is not None
-    assert model.blocks[0].mixer.engine_fusion.weight.grad is not None
-    assert model.blocks[0].mixer.gain_proj is not None
-    assert model.blocks[0].mixer.gain_proj.weight.grad is not None
-    assert model.blocks[0].mixer.gain_predictor is not None
-    assert model.blocks[0].mixer.gain_predictor.signal_out.weight.grad is not None
-    assert len(model.blocks[0].mixer.cube_engines) == 3
-    for engine in model.blocks[0].mixer.cube_engines:
-        assert engine.input_gain.grad is not None
-        _assert_prediction_projector_has_grad(engine.prediction_proj)
-
-
-def test_model_is_causal() -> None:
-    torch.manual_seed(0)
-    model = make_model().eval()
-    prefix = torch.tensor([[1, 2, 3, 4, 5, 6]])
-    altered = torch.tensor([[1, 2, 3, 9, 9, 9]])
-
-    prefix_logits, _ = model(prefix)
-    altered_logits, _ = model(altered)
-
-    torch.testing.assert_close(prefix_logits[:, :3], altered_logits[:, :3])
 
 
 def test_per_mode_normalization_reduces_fiber_norm_error_on_cube() -> None:
@@ -734,7 +693,6 @@ def test_input_dependent_gain_predictor_varies_with_signal() -> None:
         num_cube_engines=1,
         normalization="frobenius",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1.0,
         growth_interval=1,
@@ -782,7 +740,6 @@ def test_selective_gain_predictor_can_suppress_dynamic_modulation() -> None:
         num_cube_engines=1,
         normalization="frobenius",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1.0,
         growth_interval=1,
@@ -888,76 +845,6 @@ def test_new_default_model_loads_static_checkpoint_without_gain_predictor_weight
     static_state = static_model.state_dict()
 
     restored = ReciprocatorOnlyLM(
-        ModelConfig(
-            vocab_size=32,
-            max_seq_len=16,
-            dim=32,
-            n_layers=1,
-            n_heads=4,
-            state_rank=3,
-            state_mode_sizes=(2, 2, 2),
-            num_cube_engines=2,
-            normalization="frobenius",
-            dropout=0.0,
-        )
-    )
-    restored.load_state_dict(static_state)
-
-    assert restored.blocks[0].mixer.gain_predictor is not None
-    signal_real = torch.zeros(1, 2, 2, 2)
-    signal_imag = torch.zeros_like(signal_real)
-    relational_stats = torch.zeros(1, restored.config.state_rank + 3)
-    with torch.no_grad():
-        gain_biases = restored.blocks[0].mixer.gain_predictor(signal_real, signal_imag, relational_stats)
-    assert torch.count_nonzero(gain_biases) == 0
-
-
-def test_per_mode_real_mixer_loads_legacy_checkpoint_without_step_sizes() -> None:
-    config = ModelConfig(
-        vocab_size=32,
-        max_seq_len=16,
-        dim=32,
-        n_layers=1,
-        n_heads=4,
-        state_rank=3,
-        state_mode_sizes=(2, 2, 2),
-        num_cube_engines=2,
-        normalization="per_mode",
-        learned_per_mode_scaling=True,
-        dropout=0.0,
-    )
-    model = ModifiedTransformerLM(config)
-    legacy_state = model.state_dict()
-    legacy_state.pop("blocks.0.mixer.per_mode_step_sizes")
-
-    restored = ModifiedTransformerLM(config)
-    restored.load_state_dict(legacy_state)
-
-    assert restored.blocks[0].mixer.per_mode_step_sizes is not None
-    torch.testing.assert_close(
-        restored.blocks[0].mixer.per_mode_step_sizes,
-        torch.ones_like(restored.blocks[0].mixer.per_mode_step_sizes),
-    )
-
-
-def test_new_default_real_model_loads_static_checkpoint_without_gain_predictor_weights() -> None:
-    base_config = ModelConfig(
-        vocab_size=32,
-        max_seq_len=16,
-        dim=32,
-        n_layers=1,
-        n_heads=4,
-        state_rank=3,
-        state_mode_sizes=(2, 2, 2),
-        num_cube_engines=2,
-        normalization="frobenius",
-        dropout=0.0,
-        input_dependent_gains=False,
-    )
-    static_model = ModifiedTransformerLM(base_config)
-    static_state = static_model.state_dict()
-
-    restored = ModifiedTransformerLM(
         ModelConfig(
             vocab_size=32,
             max_seq_len=16,
@@ -1615,6 +1502,29 @@ def test_phase_aware_mode_couplings_support_multiple_state_ranks(
         assert torch.isfinite(coupling).all()
 
 
+def test_diagonal_mode_coupling_layout_zeroes_off_diagonal_terms() -> None:
+    torch.manual_seed(0)
+    cell = _CubeEngineCell(
+        state_rank=2,
+        max_mode_sizes=(2, 3),
+        normalization="per_mode",
+        impression_rate=0.35,
+        growth_threshold=1.0,
+        growth_interval=1,
+        prune_floor=0.0,
+        prune_horizon=32,
+        mode_coupling_layout="diagonal",
+    )
+    local_real = torch.randn(1, 2, 3)
+    local_imag = torch.randn(1, 2, 3)
+
+    couplings = cell._phase_aware_mode_couplings(local_real, local_imag, (2, 3))
+
+    for coupling in couplings:
+        off_diagonal = coupling - torch.diag_embed(torch.diagonal(coupling, dim1=-2, dim2=-1))
+        assert torch.count_nonzero(off_diagonal) == 0
+
+
 @pytest.mark.parametrize(
     ("state_rank", "state_mode_sizes"),
     [
@@ -1655,6 +1565,26 @@ def test_expressive_mode_couplings_support_multiple_state_ranks(
     assert coupled_imag.shape == local_imag.shape
     assert torch.isfinite(coupled_real).all()
     assert torch.isfinite(coupled_imag).all()
+
+
+def test_independent_mode_coupling_schedule_disables_expressive_path() -> None:
+    model = ReciprocatorOnlyLM(
+        ModelConfig(
+            vocab_size=32,
+            max_seq_len=16,
+            dim=32,
+            n_layers=1,
+            n_heads=4,
+            state_rank=2,
+            state_mode_sizes=(4, 4),
+            num_cube_engines=2,
+            dropout=0.0,
+            mode_coupling_schedule="independent",
+        )
+    )
+
+    for engine in model.blocks[0].mixer.cube_engines:
+        assert engine.use_expressive_mode_couplings is False
 
 
 def test_cube_engine_matches_legacy_update_when_accumulator_modulation_disabled() -> None:
@@ -2148,7 +2078,6 @@ def test_parallel_mixer_accumulator_modulation_amplifies_late_steps() -> None:
         num_cube_engines=1,
         normalization="frobenius",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1.0,
         growth_interval=1,
@@ -2166,7 +2095,6 @@ def test_parallel_mixer_accumulator_modulation_amplifies_late_steps() -> None:
         num_cube_engines=1,
         normalization="frobenius",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1.0,
         growth_interval=1,
@@ -2219,7 +2147,6 @@ def test_mixer_preallocated_projections() -> None:
         num_cube_engines=2,
         normalization="per_mode",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1.0,
         growth_interval=1,
@@ -2255,7 +2182,6 @@ def test_online_mixer_preallocated_projections_respect_active_mask() -> None:
         num_cube_engines=2,
         normalization="per_mode",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1e9,
         growth_interval=1,
@@ -2275,7 +2201,7 @@ def test_online_mixer_preallocated_projections_respect_active_mask() -> None:
     assert torch.count_nonzero(signal_grad.abs().sum(dim=1)[~active_mask]) == 0
 
 
-def test_complex_mixer_zero_signal_stays_zero_without_magnitude_floor() -> None:
+def test_complex_mixer_zero_signal_stays_zero() -> None:
     mixer = ComplexReciprocatorMixer(
         hidden_dim=8,
         state_dim=27,
@@ -2285,7 +2211,6 @@ def test_complex_mixer_zero_signal_stays_zero_without_magnitude_floor() -> None:
         num_cube_engines=2,
         normalization="per_mode",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=1.0,
         growth_interval=1,
@@ -2406,7 +2331,6 @@ def test_nonpersistent_training_mixer_keeps_fixed_support_even_with_growth_recip
         num_cube_engines=2,
         normalization="per_mode",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=0.0,
         growth_interval=1,
@@ -2435,7 +2359,6 @@ def test_nonpersistent_eval_mixer_does_not_grow_by_default() -> None:
         num_cube_engines=2,
         normalization="per_mode",
         impression_rate=0.35,
-        magnitude_floor=1e-3,
         dropout=0.0,
         growth_threshold=0.0,
         growth_interval=1,
@@ -2452,12 +2375,30 @@ def test_nonpersistent_eval_mixer_does_not_grow_by_default() -> None:
     assert growth_after == growth_before
 
 
-def test_growth_threshold_anneals_from_ten_x_to_nominal() -> None:
+def test_growth_threshold_uses_explicit_warmup_window() -> None:
     nominal = 0.02
 
-    assert _annealed_growth_threshold(nominal, step=1, total_steps=100) == pytest.approx(0.2)
-    assert _annealed_growth_threshold(nominal, step=10, total_steps=100) == pytest.approx(nominal)
-    assert _annealed_growth_threshold(nominal, step=100, total_steps=100) == pytest.approx(nominal)
+    assert _effective_growth_threshold(
+        nominal,
+        step=1,
+        total_steps=100,
+        warmup_steps=10,
+        warmup_multiplier=10.0,
+    ) == pytest.approx(0.2)
+    assert _effective_growth_threshold(
+        nominal,
+        step=10,
+        total_steps=100,
+        warmup_steps=10,
+        warmup_multiplier=10.0,
+    ) == pytest.approx(0.2)
+    assert _effective_growth_threshold(
+        nominal,
+        step=11,
+        total_steps=100,
+        warmup_steps=10,
+        warmup_multiplier=10.0,
+    ) == pytest.approx(nominal)
 
 
 def test_reset_optimizer_moments_clears_adam_state() -> None:

@@ -475,14 +475,23 @@ def _nominal_growth_threshold(model: nn.Module) -> Optional[float]:
     return float(first_engine.growth_threshold)
 
 
-def _annealed_growth_threshold(nominal_threshold: float, step: int, total_steps: int) -> float:
+def _effective_growth_threshold(
+    nominal_threshold: float,
+    step: int,
+    total_steps: int,
+    warmup_steps: int = 0,
+    warmup_multiplier: float = 10.0,
+) -> float:
+    """Schedule-independent growth threshold with explicit warmup period."""
+    del total_steps
     if nominal_threshold <= 0.0:
         return nominal_threshold
-    warmup_steps = max(1, math.ceil(total_steps * 0.1))
-    if warmup_steps == 1:
-        return nominal_threshold
-    progress = min(max(step - 1, 0), warmup_steps - 1) / float(warmup_steps - 1)
-    return nominal_threshold * (10.0 - 9.0 * progress)
+
+    if step <= warmup_steps:
+        # Strong suppression during warmup so the engine can learn patterns first.
+        return nominal_threshold * warmup_multiplier
+
+    return nominal_threshold
 
 
 def _reset_optimizer_moments(optimizer: torch.optim.Optimizer) -> None:
@@ -727,6 +736,12 @@ def train_benchmark_task(
 
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    model_config = getattr(model, "config", None)
+    nominal_growth_threshold = (
+        float(model_config.growth_threshold)
+        if model_config is not None and hasattr(model_config, "growth_threshold")
+        else _nominal_growth_threshold(model)
+    )
     last_train_loss = float("nan")
     last_eval_metrics: Optional[Dict[str, Dict[str, float]]] = None
     loss_history: list[Dict[str, float]] = []
@@ -742,6 +757,15 @@ def train_benchmark_task(
             set_online_state_gradient_tracking(False)
 
     for step in range(1, config.steps + 1):
+        if nominal_growth_threshold is not None:
+            effective_threshold = _effective_growth_threshold(
+                nominal_threshold=nominal_growth_threshold,
+                step=step,
+                total_steps=config.steps,
+                warmup_steps=getattr(model_config, "growth_warmup_steps", 0),
+                warmup_multiplier=getattr(model_config, "growth_warmup_multiplier", 10.0),
+            )
+            _set_growth_threshold(model, effective_threshold)
         model.train()
         batch = BENCHMARK_FACTORIES[benchmark_name](
             num_examples=config.batch_size,
@@ -818,6 +842,12 @@ def train_causal_language_model(
 
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    model_config = getattr(model, "config", None)
+    nominal_growth_threshold = (
+        float(model_config.growth_threshold)
+        if model_config is not None and hasattr(model_config, "growth_threshold")
+        else _nominal_growth_threshold(model)
+    )
     batch_generator = torch.Generator(device="cpu").manual_seed(config.seed)
 
     best_val_loss = float("inf")
@@ -857,6 +887,15 @@ def train_causal_language_model(
         resumed_from_checkpoint = True
 
     for step in range(start_step + 1, config.steps + 1):
+        if nominal_growth_threshold is not None:
+            effective_threshold = _effective_growth_threshold(
+                nominal_threshold=nominal_growth_threshold,
+                step=step,
+                total_steps=config.steps,
+                warmup_steps=getattr(model_config, "growth_warmup_steps", 0),
+                warmup_multiplier=getattr(model_config, "growth_warmup_multiplier", 10.0),
+            )
+            _set_growth_threshold(model, effective_threshold)
         model.train()
         input_ids, target_ids = sample_causal_lm_batch(
             train_tokens,

@@ -28,8 +28,8 @@ from reciprocator_lm import (
     train_sentencepiece_tokenizer,
 )
 from reciprocator_lm.experiments import (
-    _annealed_growth_threshold,
     _count_growth_events,
+    _effective_growth_threshold,
     _reset_optimizer_moments,
     _set_growth_threshold,
 )
@@ -274,7 +274,10 @@ def _streaming_train_step(
         raise ValueError("tbptt_horizon must be non-negative")
 
     tbptt_enabled = tbptt_horizon > 0
-    model.reset_online_state()
+    # Streaming mode is meant to preserve the Reciprocator's online working
+    # memory across optimizer steps. The state is initialized once when
+    # streaming mode starts, then only reset on true stream boundaries such as
+    # corpus wrap events below.
     model.set_online_state_gradient_tracking(tbptt_enabled)
 
     chunk_losses: list[float] = []
@@ -298,6 +301,9 @@ def _streaming_train_step(
         if _should_reset_stream_state(stream_reset_policy, wrapped=wrapped):
             if tbptt_enabled:
                 flush_window()
+            # Reset only at real stream boundaries. This clears the numerical
+            # online state when the corpus wraps (or other reset policies ask
+            # for it), but preserves state across ordinary optimizer steps.
             model.reset_online_state()
         inputs = chunk_inputs.unsqueeze(0).to(device=device)
         targets = chunk_targets.unsqueeze(0).to(device=device)
@@ -667,6 +673,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--growth-threshold", type=float, default=0.02)
+    parser.add_argument(
+        "--growth-warmup-steps",
+        type=int,
+        default=800,
+        help="Steps to suppress growth so engine can stabilize first",
+    )
+    parser.add_argument(
+        "--growth-warmup-multiplier",
+        type=float,
+        default=10.0,
+        help="Multiplier on growth_threshold during warmup (default 10x)",
+    )
     parser.add_argument("--growth-interval", type=int, default=1)
     parser.add_argument(
         "--parallel-mixer",
@@ -1090,6 +1108,8 @@ def main() -> None:
             wavelet_packet_stationary=args.wavelet_packet_stationary,
             wavelet_packet_cycle_spins=args.wavelet_packet_cycle_spins,
             growth_threshold=args.growth_threshold,
+            growth_warmup_steps=args.growth_warmup_steps,
+            growth_warmup_multiplier=args.growth_warmup_multiplier,
             growth_interval=args.growth_interval,
             persist_state=args.training_mode == "streaming",
             parallel_mixer=args.parallel_mixer,
@@ -1217,6 +1237,7 @@ def main() -> None:
 
     model.train()
     t0 = time.time()
+    nominal_growth_threshold = float(config.growth_threshold)
     for step in range(start_step + 1, args.steps + 1):
         current_lr = args.lr * _lr_multiplier(
             step=step,
@@ -1227,7 +1248,13 @@ def main() -> None:
             step_offset=lr_step_offset,
         )
         _set_optimizer_lr(optimizer, current_lr)
-        current_growth_threshold = _annealed_growth_threshold(config.growth_threshold, step, args.steps)
+        current_growth_threshold = _effective_growth_threshold(
+            nominal_threshold=nominal_growth_threshold,
+            step=step,
+            total_steps=args.steps,
+            warmup_steps=getattr(config, "growth_warmup_steps", 0),
+            warmup_multiplier=getattr(config, "growth_warmup_multiplier", 10.0),
+        )
         _set_growth_threshold(model, current_growth_threshold)
         growth_events_before = _count_growth_events(model)
         optimizer.zero_grad(set_to_none=True)
@@ -1255,6 +1282,9 @@ def main() -> None:
             _reset_optimizer_moments(optimizer)
         optimizer.step()
         if training_mode == "streaming":
+            # Keep the online state values for the next chunk/step while
+            # truncating the autograd graph, so streaming training behaves like
+            # TBPTT over a persistent working memory.
             model.detach_online_state()
 
         metric_value = train_loss
